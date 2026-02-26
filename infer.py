@@ -1596,29 +1596,32 @@ def _predownload_objaverse_glbs(scene_data):
     elif 'objects' in scene_data:
         objects_list = scene_data.get('objects', [])
     
-    uids_to_download = []
+    objaverse_objs = []
     for obj in objects_list:
         if obj.get('asset_source') == 'objaverse' and obj.get('uid'):
-            uids_to_download.append(obj['uid'])
+            objaverse_objs.append(obj)
     
-    if not uids_to_download:
+    if not objaverse_objs:
         return
     
-    print(f"Pre-downloading {len(uids_to_download)} Objaverse GLB files...")
+    print(f"Pre-downloading {len(objaverse_objs)} Objaverse GLB files...")
     
     downloaded = 0
-    for uid in uids_to_download:
+    for obj in objaverse_objs:
+        uid = obj['uid']
         try:
             glb_path = get_objaverse_glb_path(uid, download_if_missing=True)
             if glb_path and os.path.exists(glb_path):
                 downloaded += 1
+                # Write resolved path into scene JSON so Blender subprocess can find it directly
+                obj['glb_path'] = glb_path
                 print(f"  ✓ Downloaded: {uid[:16]}... ({os.path.getsize(glb_path) / 1024:.1f} KB)")
             else:
                 print(f"  ✗ Failed to download: {uid[:16]}...")
         except Exception as e:
             print(f"  ✗ Error downloading {uid[:16]}...: {e}")
     
-    print(f"Pre-download complete: {downloaded}/{len(uids_to_download)} files")
+    print(f"Pre-download complete: {downloaded}/{len(objaverse_objs)} files")
 
 
 def render_scene_to_image(scene_data, output_dir, iteration, enable_visualization=False):
