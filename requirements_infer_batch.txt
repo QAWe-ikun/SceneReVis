@@ -58,7 +58,7 @@ accelerate>=0.30.0
 
 # Flash Attention: Efficient attention mechanism (requires CUDA)
 # Note: flash-attn needs to be compiled from source or use a pre-built wheel
-flash-attn>=2.7.0
+# flash-attn>=2.7.0
 
 # ===== Logging & Monitoring =====
 # SwanLab: Experiment tracking

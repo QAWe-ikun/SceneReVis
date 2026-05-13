@@ -5,7 +5,7 @@
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 3D资产目录
-export PTH_3DFUTURE_ASSETS="/path/to/datasets/3d-front/3D-FUTURE-model"
+export PTH_3DFUTURE_ASSETS="/mnt/d/3D-Dataset/3D-FUTURE-model"
 
 # Metadata files
 export PTH_ASSETS_METADATA="${PROJECT_ROOT}/metadata/model_info_3dfuture_assets.json"

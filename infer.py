@@ -3467,7 +3467,7 @@ Format template:
             model_type="qwen2_5_vl", 
             seed=42,
             tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=0.5,
+            gpu_memory_utilization=0.9,
             template=template
         )
     else:
