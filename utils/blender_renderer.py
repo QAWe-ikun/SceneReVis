@@ -283,17 +283,22 @@ def _bpy_import_real_asset(obj_data, index, assets_base_env_var='PTH_3DFUTURE_AS
         jid = obj_data.get('jid') or obj_data.get('sampled_asset_jid') or f'obj_{index}'
         asset_id = jid
         asset_root = os.getenv(assets_base_env_var)
+        print(f'[bpy] Asset {asset_id}: asset_root from env={asset_root}')
         if asset_root:
             candidate = Path(asset_root) / jid / 'raw_model.glb'
+            print(f'[bpy] Asset {asset_id}: candidate={candidate}, exists={candidate.is_file()}')
             if candidate.is_file():
                 mesh_path = candidate
                 asset_dir = candidate.parent
     
     if asset_id is None:
         asset_id = f'obj_{index}'
-    
+
+    # Always print debug info for asset loading
+    print(f'[bpy] Asset {asset_id}: source={asset_source}, mesh_path={mesh_path}, mesh_exists={mesh_path.is_file() if mesh_path else "None"}')
+
     imported_objects = []
-    
+
     # Load GLB format
     if mesh_path is not None:
         try:
@@ -321,7 +326,9 @@ def _bpy_import_real_asset(obj_data, index, assets_base_env_var='PTH_3DFUTURE_AS
                 
                 _debug_print(f'[bpy] Asset {asset_id}: orientation correction applied')
         except Exception as e:  # noqa: BLE001
-            _debug_print(f'[bpy] Failed to import {mesh_path}: {e}')
+            print(f'[bpy] ERROR importing {mesh_path}: {e}')  # Always print, not debug
+            import traceback
+            traceback.print_exc()
     
     if not imported_objects:
         # If real asset import failed, do not create any placeholder

@@ -129,6 +129,23 @@ def render_scene_blender_external(scene_data, output_dir, scene_id="scene", enab
             env['BPY_VERBOSE'] = '1'
             # Don't use placeholders, render real 3D models and textures
             env['BPY_USE_PLACEHOLDER_ONLY'] = '0'
+
+            # CRITICAL: Ensure PTH_3DFUTURE_ASSETS is explicitly set
+            if not env.get('PTH_3DFUTURE_ASSETS'):
+                possible_paths = [
+                    '/mnt/d/3D-Dataset/3D-FUTURE-model',
+                    '/path/to/datasets/3d-front/3D-FUTURE-model',
+                    os.path.expanduser('~/datasets/3D-FUTURE-model'),
+                ]
+                for p in possible_paths:
+                    if os.path.exists(p):
+                        env['PTH_3DFUTURE_ASSETS'] = p
+                        print(f"[blender_wrapper] Explicitly set PTH_3DFUTURE_ASSETS = {p}")
+                        break
+                if not env.get('PTH_3DFUTURE_ASSETS'):
+                    print("[blender_wrapper] WARNING: PTH_3DFUTURE_ASSETS not set and no candidate path found!")
+            else:
+                print(f"[blender_wrapper] PTH_3DFUTURE_ASSETS already set in env: {env['PTH_3DFUTURE_ASSETS']}")
             
             # Enable fast rendering mode (512x512, 8 samples)
             if fast_mode is None:

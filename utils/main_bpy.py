@@ -30,6 +30,10 @@ def _debug_print(*args, **kwargs):
     if _should_print_debug():
         print(*args, **kwargs)
 
+# Debug: print environment variables relevant to asset loading right at startup
+print(f'[main_bpy] PTH_3DFUTURE_ASSETS = {os.environ.get("PTH_3DFUTURE_ASSETS", "NOT SET")}')
+print(f'[main_bpy] OBJAVERSE_GLB_CACHE_DIR = {os.environ.get("OBJAVERSE_GLB_CACHE_DIR", "NOT SET")}')
+
 try:
     from blender_renderer import render_scene_frame_bpy_inproc
 except Exception as e:  # noqa: BLE001

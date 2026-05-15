@@ -105,6 +105,7 @@ class PathConfig:
         ]
         
         local_paths = [
+            "/mnt/d/3D-Dataset/3D-FUTURE-model",
             "/path/to/datasets/3d-front/3D-FUTURE-model",
             "/path/to/data/datasets/3d-front/3D-FUTURE-model",
             os.path.expanduser("~/datasets/3D-FUTURE-model"),

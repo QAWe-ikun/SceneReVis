@@ -42,7 +42,8 @@ AZURE_OPENAI_API_VERSION = "2025-03-01-preview"
 AZURE_OPENAI_SCOPE = "YOUR_AZURE_OPENAI_SCOPE"
 
 # Set necessary environment variables for asset retrieval
-os.environ['PTH_3DFUTURE_ASSETS'] = '/path/to/datasets/3d-front/3D-FUTURE-model'
+# Use shell env var if already set, otherwise fall back to actual dataset path
+os.environ.setdefault('PTH_3DFUTURE_ASSETS', '/mnt/d/3D-Dataset/3D-FUTURE-model')
 os.environ['PTH_INVALID_ROOMS'] = './metadata/invalid_threed_front_rooms.txt'
 os.environ['PTH_ASSETS_METADATA'] = './metadata/model_info_3dfuture_assets.json'
 os.environ['PTH_ASSETS_METADATA_SCALED'] = './metadata/model_info_3dfuture_assets_scaled.json'
