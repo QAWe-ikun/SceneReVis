@@ -35,14 +35,19 @@ def _make_rect_scene(x_min=-3, x_max=3, z_min=-3, z_max=3, objects=None):
 
 
 def test_empty_room_all_feasible():
-    """Empty rectangular room -> all cells should be feasible."""
+    """Empty rectangular room -> all cells inside room bounds should be feasible."""
     scene = _make_rect_scene()
     mask, ortho_scale, cx, cz = compute_mask(scene, heatmap_res=64)
 
-    # All cells should be True (feasible)
-    assert mask.all(), "Empty room should have all feasible cells"
+    # Grid covers ortho_scale (1.2x room), so cells outside room bounds are False.
+    # Check that cells INSIDE room bounds are all True.
+    # Room: X=[-3,3], Z=[-3,3]. ortho_scale=7.2, center=(0,0).
+    # Grid spans [-3.6, 3.6]. Room interior in grid: ~[5, 58] out of 64.
+    margin = 6  # cells outside room bounds (plus safety)
     assert mask.shape == (64, 64)
     assert ortho_scale > 0
+    assert mask[margin:-margin, margin:-margin].all(), \
+        "All cells inside room bounds should be feasible"
     print("PASS: test_empty_room_all_feasible")
 
 
@@ -55,15 +60,16 @@ def test_object_creates_collision():
         "rot": [0, 0, 0, 1],  # no rotation
     }
     scene = _make_rect_scene(objects=[obj])
-    mask, _, cx, cz = compute_mask(scene, heatmap_res=64, clearance=0)
+    mask, ortho_scale, cx, cz = compute_mask(scene, heatmap_res=64, clearance=0)
 
     # Some cells should be masked out (collision)
     collision_count = (~mask).sum()
     assert collision_count > 0, f"Object should create collision cells, got {collision_count}"
 
-    # Room boundary cells should still be feasible
-    assert mask[0, 0], "Corner should be feasible"
-    assert mask[-1, -1], "Corner should be feasible"
+    # Cells near room corners (inside room bounds) should still be feasible
+    margin = 6  # cells outside room bounds (plus safety)
+    assert mask[margin, margin], f"Room corner should be feasible"
+    assert mask[-margin, -margin], f"Room corner should be feasible"
     print(f"PASS: test_object_cre_collision ({collision_count} collision cells)")
 
 

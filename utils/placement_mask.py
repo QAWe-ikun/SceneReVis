@@ -349,10 +349,14 @@ def compute_mask(scene: Dict[str, Any], heatmap_res: int = 256,
     span = max(x_max - x_min, z_max - z_min, 1)
     ortho_scale = span * 1.2
 
+    # Grid covers ortho_scale extent (matches Blender top view)
+    gx_min, gx_max = cx - ortho_scale / 2, cx + ortho_scale / 2
+    gz_min, gz_max = cz - ortho_scale / 2, cz + ortho_scale / 2
+
     objects = _extract_objects(scene)
 
     # Step 1: Room boundary mask
-    mask = _room_mask(bounds_bottom, heatmap_res, x_min, x_max, z_min, z_max)
+    mask = _room_mask(bounds_bottom, heatmap_res, gx_min, gx_max, gz_min, gz_max)
 
     # Step 2: Handle placement_plane
     if placement_plane != "floor":
@@ -371,20 +375,20 @@ def compute_mask(scene: Dict[str, Any], heatmap_res: int = 256,
         else:
             # Restrict mask to target object's top surface
             surface_mask = _target_surface_mask(target_obj, heatmap_res,
-                                                x_min, x_max, z_min, z_max)
+                                                gx_min, gx_max, gz_min, gz_max)
             mask = mask & surface_mask
 
         # For surface placement, collision mask only considers other objects
         # that are on the same surface (simplified: mask all non-target objects
         # whose footprint overlaps with the target surface)
         # For now, we mask all other objects normally
-        col_mask = _collision_mask(objects, heatmap_res, x_min, x_max, z_min, z_max,
+        col_mask = _collision_mask(objects, heatmap_res, gx_min, gx_max, gz_min, gz_max,
                                    placement_plane=placement_plane)
         mask = mask & col_mask
 
     else:
         # Floor placement: apply collision mask with height layering
-        col_mask = _collision_mask(objects, heatmap_res, x_min, x_max, z_min, z_max,
+        col_mask = _collision_mask(objects, heatmap_res, gx_min, gx_max, gz_min, gz_max,
                                    placement_plane="floor")
         mask = mask & col_mask
 

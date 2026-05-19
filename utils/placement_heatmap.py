@@ -505,7 +505,7 @@ def find_best_position_from_score(score: np.ndarray, ortho_scale: float,
     for _ in range(top_k):
         idx = np.argmax(working_score.ravel())
         gi, gj = divmod(idx, heatmap_res)
-        x, z = grid_to_world(gi, gj, cx, cz, heatmap_res)
+        x, z = grid_to_world(gi, gj, cx, cz, ortho_scale, heatmap_res)
 
         # Y coordinate
         if placement_plane == "floor":
