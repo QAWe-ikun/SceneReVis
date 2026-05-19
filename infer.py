@@ -1441,40 +1441,118 @@ def retrieve_and_update_assets(scene_data, asset_retrieval_module=None,
 
 def apply_tool_calls_to_scene(initial_scene, tool_calls):
     """Use scene_editor's apply_tool_calls function to modify the scene
-    
+
     This function automatically handles format conversion:
     1. If input is in flat format (without groups), first convert to grouped format
-    2. Apply tool_calls to modify the scene  
+    2. Apply tool_calls to modify the scene
     3. **Always return flat format** (without groups)
     """
     if not apply_tool_calls:
         print("Warning: scene_editor not available, using fallback")
         return initial_scene
-    
+
     try:
         # Detect input format
         is_flat_format = 'objects' in initial_scene and 'groups' not in initial_scene
-        
+
         # If in flat format (without groups), first convert to grouped format
         if is_flat_format:
             print("Detected flat format (without groups), converting to grouped format for editing...")
             scene_for_editing = convert_flat_to_grouped(initial_scene)
         else:
             scene_for_editing = initial_scene
-        
+
         # Use scene_editor module's apply_tool_calls function
         edited_scene = apply_tool_calls(scene_for_editing, tool_calls)
-        
+
         # **Key**: Always convert back to flat format before returning
         final_scene = convert_grouped_to_flat(edited_scene) if 'groups' in edited_scene else edited_scene
         print("Returning scene in flat format (without groups)")
-        
+
         return final_scene
     except Exception as e:
         print(f"Error applying tool calls: {e}")
         import traceback
         traceback.print_exc()
         return initial_scene
+
+
+# Global placement engine (lazy-initialized)
+_placement_engine = None
+
+
+def _get_placement_engine(top_view_path: str, heatmap_res: int = 256, enable_heatmap: bool = False):
+    """Lazy-initialize the placement engine singleton."""
+    global _placement_engine
+    if _placement_engine is None:
+        from utils.placement_heatmap import PlacementEngine
+        _placement_engine = PlacementEngine(heatmap_res=heatmap_res, enable_heatmap=enable_heatmap)
+    return _placement_engine
+
+
+def resolve_placement_positions(scene, tool_calls, top_view_path: str,
+                                heatmap_res: int = 256, enable_heatmap: bool = False):
+    """Preprocess tool calls to compute positions for add_object calls.
+
+    For each add_object tool call that has 'placement_plane' but no 'position',
+    compute the optimal position using the placement engine and inject it.
+
+    Args:
+        scene: current scene (grouped format)
+        tool_calls: list of tool call dicts (modified in-place)
+        top_view_path: path to raw top-view PNG
+        heatmap_res: grid resolution
+        enable_heatmap: whether to use learning-based heatmap or mask-only mode
+
+    Returns:
+        tool_calls list (same reference, modified in-place)
+    """
+    engine = _get_placement_engine(top_view_path, heatmap_res, enable_heatmap)
+
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        if tc.get('name') != 'add_object':
+            continue
+
+        args = tc.get('arguments', {})
+        if 'position' in args:
+            # Already has position, skip (backward compatibility)
+            continue
+
+        # Need to compute position
+        object_desc = args.get('object_description', 'New furniture piece')
+        size = args.get('size', [1, 1, 1])
+        rotation = args.get('rotation', [0, 0, 0, 1])
+        placement_plane = args.get('placement_plane', 'floor')
+
+        # Convert grouped scene to flat for the placement engine
+        flat_scene = convert_grouped_to_flat(scene) if 'groups' in scene else scene
+
+        position = engine.place_object(
+            scene=flat_scene,
+            top_view_path=top_view_path,
+            object_desc=object_desc,
+            size=size,
+            rotation=rotation,
+            placement_plane=placement_plane,
+        )
+
+        if position is not None:
+            args['position'] = position
+            print(f"[placement] Computed position for '{object_desc}': {position}")
+        else:
+            # Fallback to center of room
+            bounds = flat_scene.get('room_envelope', {}).get('bounds_bottom', [])
+            if bounds:
+                cx = sum(p[0] for p in bounds) / len(bounds)
+                cz = sum(p[2] for p in bounds) / len(bounds)
+            else:
+                cx, cz = 0, 0
+            args['position'] = [cx, 0, cz]
+            print(f"[placement] WARNING: no feasible position for '{object_desc}', using fallback [{cx}, 0, {cz}]")
+
+    return tool_calls
 
 def check_and_retrieve_assets(scene_data, asset_retrieval_module=None, asset_source='3d-future', objaverse_retriever=None):
     """Check if the scene has assets that need retrieval, and perform retrieval
@@ -1625,32 +1703,37 @@ def _predownload_objaverse_glbs(scene_data):
     print(f"Pre-download complete: {downloaded}/{len(objaverse_objs)} files")
 
 
-def render_scene_to_image(scene_data, output_dir, iteration, enable_visualization=False):
+def render_scene_to_image(scene_data, output_dir, iteration, enable_visualization=False, save_top_view=False):
     """Render scene using Blender and return merged image path
-    
+
     Args:
         scene_data: Scene data
         output_dir: Output directory
         iteration: Iteration number
         enable_visualization: Whether to enable 3D visualization guide lines
+        save_top_view: If True, also save raw top view PNG for heatmap generation
+
+    Returns:
+        If save_top_view is False: str path to merged image
+        If save_top_view is True: (merged_image_path, top_view_path) tuple
     """
     try:
         print(f"Rendering scene for iteration {iteration}...")
-        
+
         # Pre-download Objaverse GLB files (download in main process to avoid Blender subprocess needing the objaverse package)
         _predownload_objaverse_glbs(scene_data)
-        
+
         # Create temporary output directory
         temp_output_dir = Path(output_dir) / f"temp_render_{iteration}"
         temp_output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Set environment variables to control Blender output
         os.environ['BPY_VERBOSE'] = '0'  # Reduce output
         # Don't force placeholder usage, let Blender renderer try to load real 3D models
         os.environ['BPY_USE_PLACEHOLDER_ONLY'] = '0'
         # Set 3D visualization environment variables
         os.environ['BPY_ENABLE_VISUALIZATION'] = '1' if enable_visualization else '0'
-        
+
         # Use Blender rendering wrapper
         if render_scene_with_bpy:
             scene_id = f"scene_iter_{iteration}"
@@ -1658,35 +1741,45 @@ def render_scene_to_image(scene_data, output_dir, iteration, enable_visualizatio
             print(f"Blender rendering completed: {render_result}")
         else:
             print("No rendering function available, creating placeholder")
-            
+
         # Find generated image files
         top_file = temp_output_dir / "top" / "frame.png"
         diag_file = temp_output_dir / "diag" / "frame.png"
-        
+
         if top_file.exists() and diag_file.exists():
             try:
                 # Use the image merge function with bounding boxes and labels
                 import importlib.util
                 spec = importlib.util.spec_from_file_location(
-                    "image_merger", 
+                    "image_merger",
                     str(Path(__file__).parent / 'utils' / 'image_merger.py')
                 )
                 image_merger = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(image_merger)
                 merge_rendered_views_with_annotations = image_merger.merge_rendered_views_with_annotations
-                
+
                 # Save merged image
                 merged_path = Path(output_dir) / f"merged_iter_{iteration}.png"
                 merge_rendered_views_with_annotations(str(top_file), str(diag_file), str(merged_path))
-                
+
                 print(f"Rendered and merged image saved to: {merged_path}")
-                
+
+                # Optionally save raw top view for heatmap generation
+                top_view_saved = None
+                if save_top_view:
+                    top_view_saved = str(Path(output_dir) / f"top_view_iter_{iteration}.png")
+                    import shutil as _shutil
+                    _shutil.copy2(str(top_file), top_view_saved)
+                    print(f"Raw top view saved to: {top_view_saved}")
+
                 # Clean up temporary directory
                 try:
                     shutil.rmtree(temp_output_dir)
                 except:
                     pass
-                
+
+                if save_top_view:
+                    return str(merged_path), top_view_saved
                 return str(merged_path)
                 
             except Exception as img_error:
@@ -1889,7 +1982,7 @@ def iterative_scene_generation(initial_scene_path, user_prompt, engine, request_
     
     # Render initial scene as first image instead of using hardcoded path
     print("Rendering initial scene...")
-    current_image_path = render_scene_to_image(current_scene, output_path, 0, enable_visualization=enable_visualization)
+    current_image_path, current_top_view_path = render_scene_to_image(current_scene, output_path, 0, enable_visualization=enable_visualization, save_top_view=True)
     all_image_paths.append(current_image_path)
     print(f"Initial scene rendered to: {current_image_path}")
     
@@ -2029,6 +2122,14 @@ def iterative_scene_generation(initial_scene_path, user_prompt, engine, request_
                 print(f"Final scene saved to: {scene_file_path}")
                 break
             
+            # Resolve placement positions for add_object calls before applying
+            if current_top_view_path:
+                tool_calls = resolve_placement_positions(
+                    current_scene, tool_calls,
+                    top_view_path=current_top_view_path,
+                    enable_heatmap=False  # Set to True when heatmap model is trained
+                )
+
             # Use scene_editor to apply tool calls to generate final scene
             final_scene = apply_tool_calls_to_scene(current_scene, tool_calls)
             print("Applied tool calls to generate final scene")
@@ -2085,9 +2186,9 @@ def iterative_scene_generation(initial_scene_path, user_prompt, engine, request_
             json.dump(final_scene_to_save, f, indent=2, ensure_ascii=False)
         
         all_scenes.append(final_scene_to_save)
-        
-        # Render scene as image (using flat format)
-        current_image_path = render_scene_to_image(final_scene_to_save, output_path, iteration + 1, enable_visualization=enable_visualization)
+
+        # Render scene as image (using flat format), also save top view for placement
+        current_image_path, current_top_view_path = render_scene_to_image(final_scene_to_save, output_path, iteration + 1, enable_visualization=enable_visualization, save_top_view=True)
         all_image_paths.append(current_image_path)
         
         # Update current scene for next iteration (using flat format)
@@ -2308,6 +2409,7 @@ def batch_iterative_scene_generation_parallel(prompts: List[str], engine, reques
             "conversation_history": [],
             "current_scene": None,
             "current_image_path": None,
+            "current_top_view_path": None,
             "all_scenes": [],
             "all_image_paths": [],
             "error": None,
@@ -2444,11 +2546,12 @@ def batch_iterative_scene_generation_parallel(prompts: List[str], engine, reques
     for ctx in prompt_contexts:
         if ctx["status"] == "initialized":
             try:
-                ctx["current_image_path"] = render_scene_to_image(
-                    ctx["current_scene"], 
-                    ctx["output_dir"], 
+                ctx["current_image_path"], ctx["current_top_view_path"] = render_scene_to_image(
+                    ctx["current_scene"],
+                    ctx["output_dir"],
                     0,
-                    enable_visualization=enable_visualization
+                    enable_visualization=enable_visualization,
+                    save_top_view=True
                 )
                 ctx["all_image_paths"].append(ctx["current_image_path"])
                 print(f"✓ Prompt {ctx['idx']}: Initial scene rendered")
@@ -2559,6 +2662,15 @@ def batch_iterative_scene_generation_parallel(prompts: List[str], engine, reques
                             json.dump(ctx["current_scene"], f, indent=2, ensure_ascii=False)
                         continue
                     
+                    # Resolve placement positions for add_object calls before applying
+                    top_view = ctx.get("current_top_view_path")
+                    if top_view:
+                        tool_calls = resolve_placement_positions(
+                            ctx["current_scene"], tool_calls,
+                            top_view_path=top_view,
+                            enable_heatmap=False
+                        )
+
                     # Apply tool calls
                     final_scene = apply_tool_calls_to_scene(ctx["current_scene"], tool_calls)
                 else:
@@ -2594,11 +2706,12 @@ def batch_iterative_scene_generation_parallel(prompts: List[str], engine, reques
                 ctx["all_scenes"].append(final_scene)
                 
                 # Render scene
-                ctx["current_image_path"] = render_scene_to_image(
-                    final_scene, 
-                    ctx["output_dir"], 
+                ctx["current_image_path"], ctx["current_top_view_path"] = render_scene_to_image(
+                    final_scene,
+                    ctx["output_dir"],
                     iteration + 1,
-                    enable_visualization=enable_visualization
+                    enable_visualization=enable_visualization,
+                    save_top_view=True
                 )
                 ctx["all_image_paths"].append(ctx["current_image_path"])
                 
@@ -3410,11 +3523,11 @@ Format template:
 ```
 
 ### Available Tools
-**1. add_object**: Add a new furniture piece.
-* `object_description` (string)
-* `position` (array)
-* `rotation` (array)
-* `size` (array)
+**1. add_object**: Add a new furniture piece. Position is automatically computed by the placement system.
+* `object_description` (string) — what object to place
+* `size` (array) — [width, height, depth] in meters
+* `rotation` (array) — quaternion [x, y, z, w] controlling orientation ([0,0,0,1] = no rotation, [0,0.707,0,0.707] = 90° Y-axis rotation)
+* `placement_plane` (string) — where to place: "floor" for ground, or the jid of an existing object to place on its top surface (e.g. a lamp on a desk). If unsure, use "floor".
 
 **2. remove_object**: Remove an existing object.
 * `jid/uid` (string)
@@ -3887,6 +4000,14 @@ This iteration builds upon our previous improvements to create a more complete l
                 print(f"Final scene saved to: {scene_file_path}")
                 break
             
+            # Resolve placement positions for add_object calls before applying
+            if current_top_view_path:
+                tool_calls = resolve_placement_positions(
+                    current_scene, tool_calls,
+                    top_view_path=current_top_view_path,
+                    enable_heatmap=False  # Set to True when heatmap model is trained
+                )
+
             # Use scene_editor to apply tool calls to generate final scene
             final_scene = apply_tool_calls_to_scene(current_scene, tool_calls)
             print("Applied tool calls to generate final scene")

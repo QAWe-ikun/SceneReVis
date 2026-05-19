@@ -50,19 +50,23 @@ def setup_azure_client():
     return client
 
 class SceneOptimizer:
-    def __init__(self, scene_file, models_path, format_type='ours', client=None):
+    def __init__(self, scene_file, models_path, format_type='ours', client=None,
+                 top_view_path=None, enable_heatmap_placement=False):
         self.scene_file = scene_file
         self.models_path = models_path
         self.format_type = format_type
         self.client = client
-        
+        self.top_view_path = top_view_path
+        self.enable_heatmap_placement = enable_heatmap_placement
+        self._placement_engine = None
+
         # Load scene data
         with open(scene_file, 'r') as f:
             self.scene_json = json.load(f)
-            
+
         # Parse initial data
         self.bounds_bottom, self.bounds_top, self.objects_data = parse_scene_data(self.scene_json, format_type)
-        
+
         # Create room mesh (static)
         self.room_mesh = create_room_mesh(self.bounds_bottom, self.bounds_top)
         self.floor_polygon = create_floor_polygon(self.bounds_bottom)
@@ -76,9 +80,82 @@ class SceneOptimizer:
         
         # Cache for base meshes (untransformed)
         self.mesh_cache = {} # (asset_source, asset_id) -> mesh
-        
+
         # Object importance cache
         self.object_importance = {} # jid -> 'Key' or 'Non-Key'
+
+    def _try_heatmap_placement(self, obj, manager, name, original_pos, original_rot):
+        """Try to resolve collision using heatmap-guided placement.
+
+        Computes the feasibility mask for the current scene (excluding this
+        object's current position) and picks the top-k candidate positions.
+
+        Returns:
+            True if a collision-free position was found.
+        """
+        if not self.top_view_path:
+            return False
+
+        from utils.placement_mask import compute_mask, find_best_position, grid_to_world
+        from utils.placement_heatmap import PlacementEngine
+
+        # Get object description for heatmap query
+        desc = get_object_field(obj, 'desc', self.format_type) or obj.get('desc', 'furniture')
+        size = obj.get('size', [1, 1, 1])
+        rot = obj.get('rot', [0, 0, 0, 1])
+
+        # Build flat scene for placement engine
+        flat_scene = self._get_flat_scene()
+
+        # Compute mask excluding current object's position region
+        mask, ortho_scale, cx, cz = compute_mask(flat_scene, heatmap_res=256, clearance=0.5)
+
+        if not np.any(mask):
+            return False
+
+        # Suppress the current position region so we don't pick the same spot
+        from utils.placement_mask import world_to_grid
+        gi, gj = world_to_grid(original_pos[0], original_pos[2], cx, cz, ortho_scale, 256)
+        radius = max(3, int(0.5 / (ortho_scale / 256)))  # suppress 0.5m around current pos
+        y1 = max(0, gi - radius)
+        y2 = min(256, gi + radius + 1)
+        x1 = max(0, gj - radius)
+        x2 = min(256, gj + radius + 1)
+        mask[y1:y2, x1:x2] = False
+
+        if not np.any(mask):
+            return False
+
+        # Get top-5 candidate positions
+        candidates = find_best_position(mask, ortho_scale, cx, cz, 256, top_k=5, min_distance=0.3)
+
+        for pos in candidates:
+            obj['pos'] = pos
+            test_mesh = self.get_transformed_mesh(obj)
+            if not manager.in_collision_single(test_mesh):
+                manager.add_object(name, test_mesh)
+                print(f"  Resolved collision for {obj.get('desc', '?')} via heatmap placement at {pos}")
+                return True
+
+        return False
+
+    def _get_flat_scene(self) -> dict:
+        """Get current scene state in flat format for the placement engine."""
+        # Rebuild from current objects_data
+        flat_scene = copy.deepcopy(self.scene_json)
+        if 'groups' in flat_scene:
+            del flat_scene['groups']
+        flat_scene['objects'] = []
+        for obj in self.objects_data:
+            flat_obj = {
+                'desc': get_object_field(obj, 'desc', self.format_type) or obj.get('desc', ''),
+                'size': obj.get('size', [1, 1, 1]),
+                'pos': obj.get('pos', [0, 0, 0]),
+                'rot': obj.get('rot', [0, 0, 0, 1]),
+                'jid': get_object_field(obj, 'jid', self.format_type) or '',
+            }
+            flat_scene['objects'].append(flat_obj)
+        return flat_scene
 
     def get_base_mesh(self, obj_data):
         asset_source = obj_data.get('asset_source', '3d-future')
@@ -313,50 +390,55 @@ ID 1: Non-Key
                             solved = False
                             original_pos = copy.deepcopy(obj['pos'])
                             original_rot = copy.deepcopy(obj['rot'])
-                            
-                            # Strategy 1: Position fine-tuning (Try 10 times)
-                            for _ in range(10):
-                                offset = (np.random.rand(3) - 0.5) * 0.2 # +/- 0.1m
-                                offset[1] = 0
-                                test_pos = (np.array(original_pos) + offset).tolist()
-                                obj['pos'] = test_pos
-                                
-                                test_mesh = self.get_transformed_mesh(obj)
-                                if not manager.in_collision_single(test_mesh):
-                                    solved = True
-                                    print(f"  Resolved collision for {idx} via position shift")
-                                    manager.add_object(name, test_mesh)
-                                    break
-                            
+
+                            # Strategy 1: Heatmap-guided placement (preferred)
+                            if self.enable_heatmap_placement and self.top_view_path:
+                                solved = self._try_heatmap_placement(
+                                    obj, manager, name, original_pos, original_rot
+                                )
+
+                            # Strategy 2: Position fine-tuning (Try 10 times)
                             if not solved:
-                                # Revert position to try rotation
+                                for _ in range(10):
+                                    offset = (np.random.rand(3) - 0.5) * 0.2  # +/- 0.1m
+                                    offset[1] = 0
+                                    test_pos = (np.array(original_pos) + offset).tolist()
+                                    obj['pos'] = test_pos
+
+                                    test_mesh = self.get_transformed_mesh(obj)
+                                    if not manager.in_collision_single(test_mesh):
+                                        solved = True
+                                        print(f"  Resolved collision for {idx} via position shift")
+                                        manager.add_object(name, test_mesh)
+                                        break
+
+                            # Strategy 3: Rotation (-5 to 5 degrees) (Try 10 times)
+                            if not solved:
                                 obj['pos'] = original_pos
-                                
-                                # Strategy 2: Rotation (-5 to 5 degrees) (Try 10 times)
                                 for _ in range(10):
                                     current_rot = R.from_quat(original_rot)
                                     angle = random.uniform(-5, 5)
                                     random_rot = R.from_euler('y', angle, degrees=True)
                                     new_rot = current_rot * random_rot
                                     obj['rot'] = new_rot.as_quat().tolist()
-                                    
+
                                     test_mesh = self.get_transformed_mesh(obj)
                                     if not manager.in_collision_single(test_mesh):
                                         solved = True
                                         print(f"  Resolved collision for {idx} via rotation")
                                         manager.add_object(name, test_mesh)
                                         break
-                                        
+
                             if not solved:
-                                # Both failed. Apply a random perturbation to escape local optimum
+                                # All strategies failed, apply random perturbation as last resort
                                 obj['pos'] = original_pos
                                 obj['rot'] = original_rot
-                                
+
                                 current_pos = np.array(obj['pos'])
                                 offset = (np.random.rand(3) - 0.5) * 0.2
                                 offset[1] = 0
                                 obj['pos'] = (current_pos + offset).tolist()
-                                
+
                                 print(f"  Could not resolve {idx} cleanly, applying random perturbation")
                                 manager.add_object(name, self.get_transformed_mesh(obj))
                         else:

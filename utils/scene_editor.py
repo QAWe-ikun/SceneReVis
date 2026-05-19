@@ -26,11 +26,11 @@ def _get_object_id(obj: Dict[str, Any]) -> Optional[str]:
 def _match_object_id(obj: Dict[str, Any], target_id: str) -> bool:
     """
     Check if an object matches the target ID (supports both jid and uid).
-    
+
     Args:
         obj: Object data dictionary
         target_id: Target ID to match (can be jid or uid)
-        
+
     Returns:
         Whether it matches
     """
@@ -39,31 +39,60 @@ def _match_object_id(obj: Dict[str, Any], target_id: str) -> bool:
     return obj.get('jid') == target_id or obj.get('uid') == target_id
 
 
+def _get_bounds_bottom(scene: Dict[str, Any]) -> list:
+    """Extract room bounds_bottom polygon from scene."""
+    if 'room_envelope' in scene:
+        return scene['room_envelope'].get('bounds_bottom', [])
+    if 'bounds_bottom' in scene:
+        return scene['bounds_bottom']
+    return []
+
+
 def add_object(scene: Dict[str, Any], arguments: Dict[str, Any]) -> Dict[str, Any]:
     """
     Add a new object to the scene.
-    
+
+    Supports two formats:
+      - New format (placement_plane, no position): position should have been
+        precomputed by the placement engine before calling. Falls back to
+        room center if position is missing.
+      - Old format (position): direct position, used as-is.
+
     Args:
         scene: Scene data (supports both with-groups and without-groups formats)
         arguments: Tool parameters
             - object_description: Object description
-            - position: [x, y, z] position coordinates
+            - position: [x, y, z] position coordinates (auto-computed by placement engine)
             - rotation: [x, y, z, w] quaternion rotation
             - size: [width, height, depth] dimensions
+            - placement_plane: "floor" or target object jid (used by placement engine)
             - group_name: Group name (only used in groups format)
-    
+
     Returns:
         Modified scene data
     """
     modified_scene = copy.deepcopy(scene)
-    
+
     # Extract parameters
     object_description = arguments.get('object_description', 'New furniture piece')
-    position = arguments.get('position', [0, 0, 0])
     rotation = arguments.get('rotation', [0, 0, 0, 1])
     size = arguments.get('size', [1, 1, 1])
     group_name = arguments.get('group_name', 'default_group')
-    
+
+    # Position: should have been computed by resolve_placement_positions in infer.py
+    # Fallback to room center if missing (new format without preprocessing)
+    position = arguments.get('position')
+    if position is None:
+        # Try to get room center from bounds
+        bounds = _get_bounds_bottom(modified_scene)
+        if bounds:
+            cx = sum(p[0] for p in bounds) / len(bounds)
+            cz = sum(p[2] for p in bounds) / len(bounds)
+            position = [cx, 0.0, cz]
+        else:
+            position = [0, 0, 0]
+        print(f"[add_object] No position provided for '{object_description}', using fallback {position}")
+
     # Create new object - do not set jid, let the asset retrieval module handle it
     new_object = {
         "desc": object_description,
@@ -71,7 +100,7 @@ def add_object(scene: Dict[str, Any], arguments: Dict[str, Any]) -> Dict[str, An
         "pos": position,
         "rot": rotation,
     }
-    
+
     # Check if it's groups format or flat format
     if 'groups' in modified_scene:
         # Groups format: find or create group
@@ -81,7 +110,7 @@ def add_object(scene: Dict[str, Any], arguments: Dict[str, Any]) -> Dict[str, An
                 group['objects'].append(new_object)
                 group_found = True
                 break
-        
+
         # If group not found, create a new one
         if not group_found:
             new_group = {
@@ -98,7 +127,7 @@ def add_object(scene: Dict[str, Any], arguments: Dict[str, Any]) -> Dict[str, An
         if 'objects' not in modified_scene:
             modified_scene['objects'] = []
         modified_scene['objects'].append(new_object)
-    
+
     return modified_scene
 
 
