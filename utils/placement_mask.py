@@ -304,8 +304,8 @@ def grid_to_world(gi: int, gj: int, cx: float, cz: float,
     z_min = cz - ortho_scale / 2
     cell_size_x = ortho_scale / heatmap_res
     cell_size_z = ortho_scale / heatmap_res
-    x = x_min + (gj + 0.5) * cell_size_x
-    z = z_min + (gi + 0.5) * cell_size_z
+    x = x_min + (gi + 0.5) * cell_size_x
+    z = z_min + (gj + 0.5) * cell_size_z
     return x, z
 
 
@@ -316,8 +316,8 @@ def world_to_grid(x: float, z: float, cx: float, cz: float,
     z_min = cz - ortho_scale / 2
     cell_size_x = ortho_scale / heatmap_res
     cell_size_z = ortho_scale / heatmap_res
-    gj = int((x - x_min) / cell_size_x - 0.5)
-    gi = int((z - z_min) / cell_size_z - 0.5)
+    gi = int((x - x_min) / cell_size_x - 0.5)
+    gj = int((z - z_min) / cell_size_z - 0.5)
     gi = np.clip(gi, 0, heatmap_res - 1)
     gj = np.clip(gj, 0, heatmap_res - 1)
     return gi, gj
