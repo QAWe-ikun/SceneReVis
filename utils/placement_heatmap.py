@@ -15,49 +15,63 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Tuple
 from PIL import Image
+import torchvision.transforms as T
 
 
 # ============================================================================
-# CLIP ViT Encoder (spatial feature extraction)
+# SigLIP ViT Encoder (spatial feature extraction)
 # ============================================================================
 
-class ClipViTEncoder(nn.Module):
-    """Wraps an OpenCLIP visual encoder to extract spatial patch features.
+class SiglipViTEncoder(nn.Module):
+    """Wraps a SigLIP visual encoder (via transformers) to extract spatial patch features.
 
-    Unlike standard CLIP which uses only the pooled [CLS] token,
+    Unlike standard CLIP which uses only the pooled output,
     this encoder returns the full sequence of patch tokens reshaped
     to a 2D spatial grid.
 
     Args:
-        model_name: OpenCLIP model name, e.g. "ViT-L-14"
-        pretrained: OpenCLIP pretrained weight name
+        model_name: HuggingFace model name, e.g. "google/siglip-so400m-patch14-384"
     """
 
-    def __init__(self, model_name: str = "ViT-L-14",
-                 pretrained: str = "laion2b_s32b_b82k"):
+    def __init__(self, model_name: str = "google/siglip-so400m-patch14-384"):
         super().__init__()
-        import open_clip
+        from transformers import SiglipVisionModel
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        clip_model, _, self.preprocess = open_clip.create_model_and_transforms(
-            model_name, pretrained=pretrained, device=device
-        )
+        self.model = SiglipVisionModel.from_pretrained(model_name).to(device)
 
-        # Extract the visual trunk (ViT encoder without projection head)
-        self.visual = clip_model.visual
-        self.feature_dim = self.visual.ln_post.normalized_shape[0]
+        config = self.model.config
+        self.feature_dim = config.hidden_size
+        self.patch_size = config.patch_size
+        self.image_size = config.image_size
 
-        # CLIP ViT patch grid size
-        # ViT-L-14 with 224x224 input → 224/14 = 16 patches per side
-        # But we need to handle different input resolutions
-        self.patch_size = 14  # ViT-L-14 uses 14x14 patches
-        self.input_size = 224
-        self.num_patches = (self.input_size // self.patch_size) ** 2  # 256
-        self.grid_size = self.input_size // self.patch_size  # 16
-
-        # Freeze all CLIP weights
-        for param in self.visual.parameters():
+        # Freeze all weights
+        for param in self.model.parameters():
             param.requires_grad = False
+
+        # Preprocess: resize + normalize (SigLIP uses mean=0.5, std=0.5)
+        self.preprocess = T.Compose([
+            T.Resize((self.image_size, self.image_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+
+        # Infer actual grid_size from a single forward pass
+        dummy = torch.zeros(1, 3, self.image_size, self.image_size, device=device)
+        with torch.no_grad():
+            outputs = self.model(pixel_values=dummy, output_hidden_states=True)
+        hidden = outputs.last_hidden_state
+        seq_len = hidden.shape[1]
+        # SigLIP so400m: seq_len=729=27×27 (no separate CLS token)
+        # For models that do have CLS, try both seq_len and seq_len-1
+        if int(round(seq_len ** 0.5)) ** 2 == seq_len:
+            num_patches = seq_len
+            self.drop_cls = False
+        else:
+            num_patches = seq_len - 1
+            self.drop_cls = True
+        self.grid_size = int(round(num_patches ** 0.5))
+        print(f"[SiglipViTEncoder] seq_len={seq_len}, grid={self.grid_size}x{self.grid_size}, drop_cls={self.drop_cls}")
 
         self.eval()
 
@@ -70,37 +84,12 @@ class ClipViTEncoder(nn.Module):
         Returns:
             [B, grid_size, grid_size, feature_dim] spatial feature map
         """
-        # Use the visual trunk to get patch tokens
-        x = self.visual.conv1(image)  # [B, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # [B, width, grid*grid]
-        x = x.permute(0, 2, 1)  # [B, grid*grid, width]
+        outputs = self.model(pixel_values=image, output_hidden_states=True)
+        hidden = outputs.last_hidden_state  # [B, seq_len, C]
+        patch_tokens = hidden[:, 1:, :] if self.drop_cls else hidden  # drop CLS if present
 
-        # Prepend class token
-        class_embedding = self.visual.class_embedding
-        if class_embedding.ndim == 1:
-            class_embedding = class_embedding.unsqueeze(0).unsqueeze(0)
-        class_tokens = class_embedding.expand(x.shape[0], -1, -1)
-        x = torch.cat([class_tokens, x], dim=1)  # [B, 1+grid*grid, width]
-
-        # Add positional embeddings
-        x = x + self.visual.positional_embedding.to(x.dtype)
-
-        # Transformer layers
-        x = self.visual.ln_pre(x)
-        x = x.permute(1, 0, 2)  # NLD → LND
-
-        for block in self.visual.transformer.resblocks:
-            x = block(x)
-
-        x = x.permute(1, 0, 2)  # LND → NLD
-
-        # Remove CLS token, keep patch tokens only
-        patch_tokens = x[:, 1:, :]  # [B, grid*grid, width]
-
-        # Reshape to 2D spatial grid
         B = patch_tokens.shape[0]
         features = patch_tokens.reshape(B, self.grid_size, self.grid_size, self.feature_dim)
-
         return features
 
 
@@ -234,16 +223,22 @@ class PlacementHeatmap(nn.Module):
     """Complete heatmap generation pipeline.
 
     Top View PNG → ViT Encoder → Spatial Refinement → Cross-Attention(text) → Heatmap
+
+    Uses SigLIP (via transformers) for both visual and text encoding.
+    Model weights are cached locally after first download.
     """
 
-    def __init__(self, clip_model_name: str = "ViT-L-14",
-                 clip_pretrained: str = "laion2b_s32b_b82k",
-                 heatmap_res: int = 256):
+    MODEL_NAME = "google/siglip-so400m-patch14-384"
+
+    def __init__(self, model_name: str = None, heatmap_res: int = 256):
         super().__init__()
         self.heatmap_res = heatmap_res
+        model_name = model_name or self.MODEL_NAME
 
-        # CLIP ViT encoder for spatial features
-        self.vit_encoder = ClipViTEncoder(clip_model_name, clip_pretrained)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # ViT encoder for spatial features
+        self.vit_encoder = SiglipViTEncoder(model_name)
         feature_dim = self.vit_encoder.feature_dim
 
         # Spatial refinement (windowed self-attention)
@@ -257,12 +252,20 @@ class PlacementHeatmap(nn.Module):
         # Cross-attention heatmap head
         self.heatmap_head = CrossAttentionHeatmap(
             feature_dim=feature_dim,
-            text_dim=768,
+            text_dim=feature_dim,  # SigLIP text & visual share same dim
         )
 
-        # Text encoder: simple projection from CLIP text embedding
-        # We use a lightweight text encoder that takes CLIP text tokens
-        self.text_dim = 768
+        # SigLIP text encoder
+        from transformers import SiglipTextModel, SiglipTokenizer
+        self.text_model = SiglipTextModel.from_pretrained(model_name).to(device)
+        self.tokenizer = SiglipTokenizer.from_pretrained(model_name)
+        self.text_dim = feature_dim
+
+        # Freeze text encoder too
+        for param in self.text_model.parameters():
+            param.requires_grad = False
+
+        self.text_model.eval()
 
     @torch.no_grad()
     def encode_image(self, image_path: str, device: Optional[str] = None) -> torch.Tensor:
@@ -280,54 +283,27 @@ class PlacementHeatmap(nn.Module):
 
         image = Image.open(image_path).convert("RGB")
         preprocessed = self.vit_encoder.preprocess(image).unsqueeze(0).to(device)
-
         return self.vit_encoder(preprocessed)
 
+    @torch.no_grad()
     def encode_text(self, text: str, device: Optional[str] = None) -> torch.Tensor:
-        """Encode object description into a text embedding.
-
-        Uses OpenCLIP's text encoder for consistent alignment with visual features.
+        """Encode object description into a text embedding via SigLIP.
 
         Args:
             text: object description (e.g. "bed", "desk lamp")
 
         Returns:
-            [1, text_dim] text embedding
+            [1, text_dim] text embedding (normalized)
         """
-        import open_clip
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        tokenizer = open_clip.get_tokenizer("ViT-L-14")
-        text_tokens = tokenizer([text]).to(device)
-
-        # Get text features from CLIP
-        # We need access to the text encoder, which is separate from visual
-        clip_model = self.vit_encoder.visual
-        # The text encoder is on the parent CLIP model, not just visual
-        # For now, use a simpler approach: encode text via the same mechanism
-
-        # Actually, we need the full CLIP model for text encoding.
-        # Let's create a text encoder that doesn't depend on the full CLIP model.
-        return self._encode_text_simple(text, text_tokens, device)
-
-    def _encode_text_simple(self, text: str, text_tokens: torch.Tensor,
-                            device: str) -> torch.Tensor:
-        """Simple text encoding using the CLIP text encoder."""
-        import open_clip
-
-        # We need the full CLIP model, not just visual
-        # Load it if not already available
-        if not hasattr(self, '_clip_full'):
-            self._clip_full, _, _ = open_clip.create_model_and_transforms(
-                "ViT-L-14", pretrained="laion2b_s32b_b82k", device=device
-            )
-            for param in self._clip_full.parameters():
-                param.requires_grad = False
-
-        text_features = self._clip_full.encode_text(text_tokens)
+        inputs = self.tokenizer([text], padding="max_length",
+                                truncation=True, return_tensors="pt").to(device)
+        outputs = self.text_model(**inputs)
+        text_features = outputs.pooler_output  # [1, text_dim]
         text_features = F.normalize(text_features.float(), p=2, dim=-1)
-        return text_features  # [1, 768]
+        return text_features
 
     def forward(self, image_path: str, object_desc: str,
                 device: Optional[str] = None) -> torch.Tensor:
@@ -352,7 +328,7 @@ class PlacementHeatmap(nn.Module):
         # Stage 3: Text encoding
         text_features = self.encode_text(object_desc, device)  # [1, text_dim]
 
-        # Stage 4: Cross-attention → heatmap at CLIP patch resolution
+        # Stage 4: Cross-attention → heatmap at ViT patch resolution
         heatmap_low = self.heatmap_head(spatial_features, text_features)  # [1, g, g]
 
         # Stage 5: Upsample to target heatmap resolution
@@ -363,7 +339,7 @@ class PlacementHeatmap(nn.Module):
             align_corners=False,
         ).squeeze(0).squeeze(0)  # [H, W]
 
-        # Normalize to [0, 1] (softmax already ensures sum=1, but scale for visibility)
+        # Normalize to [0, 1]
         if heatmap.max() > 0:
             heatmap = heatmap / heatmap.max()
 
