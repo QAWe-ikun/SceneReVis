@@ -3,6 +3,11 @@ Feasibility mask computation for heatmap-based object placement.
 
 Computes a 2D boolean grid (heatmap_res x heatmap_res) where True means
 the grid cell is a valid placement location for a new object.
+
+Image pixel convention (matches rendered top-down view):
+    mask[row, col] where:
+      row (first axis) → world Z, row=0 → z_min (top of image)
+      col (second axis) → world X, col=0 → x_min (left of image)
 """
 
 import numpy as np
@@ -47,22 +52,25 @@ def _compute_room_params(bounds_bottom: List[List[float]]) -> Tuple[float, float
 
 def _room_mask(bounds_bottom: List[List[float]], heatmap_res: int,
                x_min: float, x_max: float, z_min: float, z_max: float) -> np.ndarray:
-    """Binary mask: True where grid cell center is inside the room floor polygon."""
+    """Binary mask: True where grid cell center is inside the room floor polygon.
+
+    Image pixel convention:
+      mask[row, col]  row → Z (row=0 = z_max),  col → X (col=0 = x_min)
+    """
     mask = np.zeros((heatmap_res, heatmap_res), dtype=bool)
 
     if not bounds_bottom or len(bounds_bottom) < 3:
         return mask
 
-    # Grid center points slightly inset from boundary to avoid
-    # Path.contains_points treating edge points as outside
+    # Grid cell centers (image convention: row → Z descending, col → X ascending)
     cell_size_x = (x_max - x_min) / heatmap_res
     cell_size_z = (z_max - z_min) / heatmap_res
     margin_x = cell_size_x / 2
     margin_z = cell_size_z / 2
 
-    xs = np.linspace(x_min + margin_x, x_max - margin_x, heatmap_res)
-    zs = np.linspace(z_min + margin_z, z_max - margin_z, heatmap_res)
-    gx, gz = np.meshgrid(xs, zs, indexing='ij')
+    zs_row = np.linspace(z_min + margin_z, z_max - margin_z, heatmap_res)  # row 0 = min Z
+    xs_col = np.linspace(x_min + margin_x, x_max - margin_x, heatmap_res)  # col 0 = min X
+    gx, gz = np.meshgrid(xs_col, zs_row, indexing='xy')
     points = np.stack([gx.ravel(), gz.ravel()], axis=-1)
 
     # Room polygon in XZ plane
@@ -184,15 +192,15 @@ def _collision_mask(objects: List[Dict[str, Any]], heatmap_res: int,
     # Initialize: all cells are collision-free (True)
     mask = np.ones((heatmap_res, heatmap_res), dtype=bool)
 
-    # Grid cell centers (consistent with room mask)
+    # Grid cell centers (image convention: row → Z ascending, col → X ascending)
     cell_size_x = (x_max - x_min) / heatmap_res
     cell_size_z = (z_max - z_min) / heatmap_res
     margin_x = cell_size_x / 2
     margin_z = cell_size_z / 2
 
-    xs = np.linspace(x_min + margin_x, x_max - margin_x, heatmap_res)
-    zs = np.linspace(z_min + margin_z, z_max - margin_z, heatmap_res)
-    gx, gz = np.meshgrid(xs, zs, indexing='ij')
+    zs_row = np.linspace(z_min + margin_z, z_max - margin_z, heatmap_res)
+    xs_col = np.linspace(x_min + margin_x, x_max - margin_x, heatmap_res)
+    gx, gz = np.meshgrid(xs_col, zs_row, indexing='xy')
     points = np.stack([gx.ravel(), gz.ravel()], axis=-1)
 
     for obj in objects:
@@ -279,9 +287,9 @@ def _target_surface_mask(target_obj: Dict[str, Any], heatmap_res: int,
     cell_size_z = (z_max - z_min) / heatmap_res
     margin_x = cell_size_x / 2
     margin_z = cell_size_z / 2
-    xs = np.linspace(x_min + margin_x, x_max - margin_x, heatmap_res)
-    zs = np.linspace(z_min + margin_z, z_max - margin_z, heatmap_res)
-    gx, gz = np.meshgrid(xs, zs, indexing='ij')
+    zs_row = np.linspace(z_min + margin_z, z_max - margin_z, heatmap_res)
+    xs_col = np.linspace(x_min + margin_x, x_max - margin_x, heatmap_res)
+    gx, gz = np.meshgrid(xs_col, zs_row, indexing='xy')
     points = np.stack([gx.ravel(), gz.ravel()], axis=-1)
 
     # Order vertices counter-clockwise for valid Path
@@ -298,26 +306,33 @@ def grid_to_world(gi: int, gj: int, cx: float, cz: float,
                   ortho_scale: float, heatmap_res: int) -> Tuple[float, float]:
     """Convert grid cell index to world coordinates (x, z) of cell center.
 
-    Linear mapping for orthographic projection.
+    Image pixel convention:
+      gi (first index / row) → Z, gi=0 → z_min
+      gj (second index / col) → X, gj=0 → x_min
     """
-    x_min = cx - ortho_scale / 2
-    z_min = cz - ortho_scale / 2
-    cell_size_x = ortho_scale / heatmap_res
-    cell_size_z = ortho_scale / heatmap_res
-    x = x_min + (gi + 0.5) * cell_size_x
-    z = z_min + (gj + 0.5) * cell_size_z
+    x = cx + ((gj + 0.5) / heatmap_res - 0.5) * ortho_scale
+    z = cz + ((gi + 0.5) / heatmap_res - 0.5) * ortho_scale
     return x, z
 
 
 def world_to_grid(x: float, z: float, cx: float, cz: float,
                   ortho_scale: float, heatmap_res: int) -> Tuple[int, int]:
-    """Convert world coordinates (x, z) to nearest grid cell index (gi, gj)."""
-    x_min = cx - ortho_scale / 2
-    z_min = cz - ortho_scale / 2
-    cell_size_x = ortho_scale / heatmap_res
-    cell_size_z = ortho_scale / heatmap_res
-    gi = int((x - x_min) / cell_size_x - 0.5)
-    gj = int((z - z_min) / cell_size_z - 0.5)
+    """Convert world coordinates (x, z) to nearest grid cell index (gi, gj).
+
+    Image pixel convention:
+      gi (row) → Z, gi=0 → z_min
+      gj (col) → X, gj=0 → x_min
+
+    Derivation from grid_to_world:
+      x = cx + ((gj + 0.5) / R - 0.5) * S
+      => gj = (x - cx) / S * R + R/2 - 0.5
+      z = cz + ((gi + 0.5) / R - 0.5) * S
+      => gi = (z - cz) / S * R + R/2 - 0.5
+    """
+    gj_continuous = (x - cx) / ortho_scale * heatmap_res + heatmap_res / 2 - 0.5
+    gi_continuous = (z - cz) / ortho_scale * heatmap_res + heatmap_res / 2 - 0.5
+    gi = int(round(gi_continuous))
+    gj = int(round(gj_continuous))
     gi = np.clip(gi, 0, heatmap_res - 1)
     gj = np.clip(gj, 0, heatmap_res - 1)
     return gi, gj
@@ -485,8 +500,8 @@ def visualize_mask(mask: np.ndarray, ortho_scale: float,
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
     ax.imshow(mask.astype(np.float32), cmap='gray', origin='upper')
     ax.set_title(f'Feasibility Mask ({mask.shape[0]}x{mask.shape[1]})')
-    ax.set_xlabel('X grid index')
-    ax.set_ylabel('Z grid index')
+    ax.set_xlabel('X grid index (col)')
+    ax.set_ylabel('Z grid index (row)')
 
     # Add world coordinate labels
     x_min_world = cx - ortho_scale / 2

@@ -90,3 +90,9 @@ project_page/
 # Claude
 CLAUDE.md
 docs/
+
+# Checkpoint
+checkpoints/
+
+# Visualization outputs
+visualizations/

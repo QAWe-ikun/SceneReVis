@@ -1,0 +1,32 @@
+# SceneReVis 热力图训练数据生成配置
+
+data:
+  # 场景 JSON 目录 (SceneReVis 推理输出或 3D-FUTURE 场景)
+  scene_dir: "/mnt/d/3D-Dataset/dataset-ssr3dfront/scenes"
+  # 3D-FUTURE 模型文件目录
+  model_dir: "/mnt/d/3D-Dataset/3D-FUTURE-model"
+  # 输出目录
+  output_dir: "/mnt/f/scenerevis/output/heatmap_data"
+
+generation:
+  # 图像分辨率 (正方形)
+  image_size: 1024
+  # 高斯热力图 sigma (像素)
+  heatmap_sigma: 15.0
+  # 每个场景最多处理的物体数
+  max_object_nums: 5
+  # 数据集划分比例
+  split_ratio:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+  # 是否使用物体尺寸自适应 sigma
+  adaptive_sigma: false
+  # 随机种子
+  seed: 42
+  # 文本增强配置
+  text:
+    use_summary: true          # 使用 model_info_3dfuture_assets.json 中的 summary
+    use_prompts: true          # 使用 model_info_3dfuture_assets_prompts.json 中的多变体
+    use_simple_descs: true     # 使用 model_info_3dfuture_assets_simple_descs.json
+    augmentation_prob: 0.5     # 文本增强概率 (随机选择不同描述)

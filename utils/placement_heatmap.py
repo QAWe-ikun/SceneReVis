@@ -1,33 +1,32 @@
 """
-Learning-based placement heatmap module.
+Learning-based placement heatmap module (pure SigLIP architecture).
 
-Uses a ViT to encode the top-down room view, then cross-attends
-with the object description to produce a 2D placement probability field.
+Uses SigLIP for all encoding: room spatial features, object reference, and text.
+All features share the same embedding space, making fusion straightforward.
 
 Architecture:
-    Top View → ViT Encoder → Self-Attention → Cross-Attention(text query) → Heatmap
+    Room Image   → SigLIP ViT → Spatial Features (27x27) → SpatialRefinement → Key/Value
+    Object Image → SigLIP ViT → Pooled Global Feature ─┐
+                                                        ├→ ObjTextFusion → Query
+    Text         → SigLIP Text Encoder ────────────────┘
+                                                              ↓
+                                                        CrossAttention → Heatmap
 """
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Optional, Tuple
+from typing import Optional
 from PIL import Image
 import torchvision.transforms as T
 
 
 # ============================================================================
-# SigLIP ViT Encoder (spatial feature extraction)
+# SigLIP Vision Encoder (shared for room spatial + object global features)
 # ============================================================================
 
-class SiglipViTEncoder(nn.Module):
-    """Wraps a SigLIP visual encoder (via transformers) to extract spatial patch features.
-
-    Unlike standard CLIP which uses only the pooled output,
-    this encoder returns the full sequence of patch tokens reshaped
-    to a 2D spatial grid.
+class SiglipVisionEncoder(nn.Module):
+    """SigLIP vision encoder for both spatial and global features.
 
     Args:
         model_name: HuggingFace model name, e.g. "google/siglip-so400m-patch14-384"
@@ -62,8 +61,7 @@ class SiglipViTEncoder(nn.Module):
             outputs = self.model(pixel_values=dummy, output_hidden_states=True)
         hidden = outputs.last_hidden_state
         seq_len = hidden.shape[1]
-        # SigLIP so400m: seq_len=729=27×27 (no separate CLS token)
-        # For models that do have CLS, try both seq_len and seq_len-1
+        # SigLIP so400m: seq_len=729=27x27 (no separate CLS token)
         if int(round(seq_len ** 0.5)) ** 2 == seq_len:
             num_patches = seq_len
             self.drop_cls = False
@@ -71,12 +69,12 @@ class SiglipViTEncoder(nn.Module):
             num_patches = seq_len - 1
             self.drop_cls = True
         self.grid_size = int(round(num_patches ** 0.5))
-        print(f"[SiglipViTEncoder] seq_len={seq_len}, grid={self.grid_size}x{self.grid_size}, drop_cls={self.drop_cls}")
+        print(f"[SiglipVisionEncoder] seq_len={seq_len}, grid={self.grid_size}x{self.grid_size}, drop_cls={self.drop_cls}")
 
         self.eval()
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """Extract spatial features from image tensor.
+    def encode_spatial(self, image: torch.Tensor) -> torch.Tensor:
+        """Extract spatial features (2D grid) from image tensor.
 
         Args:
             image: [B, 3, H, W] preprocessed image tensor
@@ -86,11 +84,78 @@ class SiglipViTEncoder(nn.Module):
         """
         outputs = self.model(pixel_values=image, output_hidden_states=True)
         hidden = outputs.last_hidden_state  # [B, seq_len, C]
-        patch_tokens = hidden[:, 1:, :] if self.drop_cls else hidden  # drop CLS if present
+        patch_tokens = hidden[:, 1:, :] if self.drop_cls else hidden
 
         B = patch_tokens.shape[0]
         features = patch_tokens.reshape(B, self.grid_size, self.grid_size, self.feature_dim)
         return features
+
+    def encode_global(self, image: torch.Tensor) -> torch.Tensor:
+        """Extract global (pooled) feature from image tensor.
+
+        Args:
+            image: [B, 3, H, W] preprocessed image tensor
+
+        Returns:
+            [B, feature_dim] global feature vector
+        """
+        outputs = self.model(pixel_values=image)
+        # pooler_output is the mean-pooled representation
+        pooled = outputs.pooler_output  # [B, feature_dim]
+        return pooled
+
+
+# ============================================================================
+# SigLIP Text Encoder
+# ============================================================================
+
+class SiglipTextEncoder(nn.Module):
+    """SigLIP text encoder for object descriptions.
+
+    Args:
+        model_name: HuggingFace model name, e.g. "google/siglip-so400m-patch14-384"
+    """
+
+    def __init__(self, model_name: str = "google/siglip-so400m-patch14-384"):
+        super().__init__()
+        from transformers import SiglipTextModel, AutoTokenizer
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = SiglipTextModel.from_pretrained(model_name).to(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        self.feature_dim = self.model.config.hidden_size
+
+        # Freeze all weights
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        self.eval()
+
+    def encode(self, text: str) -> torch.Tensor:
+        """Encode text description.
+
+        Args:
+            text: object description string
+
+        Returns:
+            [1, feature_dim] text feature vector
+        """
+        device = next(self.model.parameters()).device
+        inputs = self.tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            max_length=64,
+            return_tensors="pt"
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            # pooler_output is the [CLS] token representation
+            text_features = outputs.pooler_output  # [1, feature_dim]
+
+        return text_features
 
 
 # ============================================================================
@@ -98,31 +163,26 @@ class SiglipViTEncoder(nn.Module):
 # ============================================================================
 
 class SpatialRefinement(nn.Module):
-    """Refines spatial features using windowed self-attention.
+    """全局自注意力细化空间特征
 
-    To avoid the O(n^2) cost on 256x256 grid, we first downsample
-    via strided conv, apply self-attention at lower resolution,
-    then upsample back.
+    在 27×27 = 729 个 token 上做全局自注意力，
+    让每个空间位置都能感知整个房间的上下文。
     """
 
     def __init__(self, in_channels: int, hidden_dim: int = 256,
-                 num_heads: int = 8, window_size: int = 8):
+                 num_heads: int = 8):
         super().__init__()
-        self.window_size = window_size
 
-        # Channel reduction for efficiency
         self.proj_in = nn.Linear(in_channels, hidden_dim)
 
-        # Windowed self-attention: process the grid in non-overlapping windows
         self.self_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim, num_heads=num_heads, batch_first=True
         )
 
-        # Output projection
         self.proj_out = nn.Linear(hidden_dim, in_channels)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """Apply windowed self-attention to spatial features.
+        """全局自注意力
 
         Args:
             features: [B, H, W, C] spatial feature map
@@ -131,35 +191,18 @@ class SpatialRefinement(nn.Module):
             [B, H, W, C] refined spatial feature map
         """
         B, H, W, C = features.shape
-        x = self.proj_in(features)  # [B, H, W, hidden]
+        x = self.proj_in(features)
 
-        # Pad to multiple of window_size
-        pad_h = (self.window_size - H % self.window_size) % self.window_size
-        pad_w = (self.window_size - W % self.window_size) % self.window_size
-        if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, 0, 0, pad_w, pad_h, 0))
+        # [B, H, W, D] -> [B, H*W, D]
+        x_flat = x.reshape(B, H * W, -1)
 
-        pH, pW = x.shape[1], x.shape[2]
-        nH, nW = pH // self.window_size, pW // self.window_size
+        # 全局自注意力 (729 tokens, 完全可行)
+        attn_out, _ = self.self_attn(x_flat, x_flat, x_flat)
 
-        # Reshape into windows: [B * nH * nW, window_size^2, hidden]
-        x_windows = x.reshape(B, nH, self.window_size, nW, self.window_size, -1)
-        x_windows = x_windows.permute(0, 1, 3, 2, 4, 5)  # [B, nH, nW, ws, ws, C]
-        x_windows = x_windows.reshape(B * nH * nW, self.window_size * self.window_size, -1)
+        # [B, H*W, D] -> [B, H, W, D]
+        attn_out = attn_out.reshape(B, H, W, -1)
 
-        # Self-attention within each window
-        attn_out, _ = self.self_attn(x_windows, x_windows, x_windows)
-
-        # Reshape back to spatial grid
-        attn_out = attn_out.reshape(B, nH, nW, self.window_size, self.window_size, -1)
-        attn_out = attn_out.permute(0, 1, 3, 2, 4, 5)  # [B, nH, ws, nW, ws, C]
-        attn_out = attn_out.reshape(B, pH, pW, -1)
-
-        # Remove padding
-        if pad_h > 0 or pad_w > 0:
-            attn_out = attn_out[:, :H, :W, :]
-
-        return self.proj_out(attn_out) + features  # residual
+        return self.proj_out(attn_out) + features
 
 
 # ============================================================================
@@ -167,20 +210,19 @@ class SpatialRefinement(nn.Module):
 # ============================================================================
 
 class CrossAttentionHeatmap(nn.Module):
-    """Computes a 2D heatmap via cross-attention between text query and spatial features.
+    """Computes a 2D heatmap via cross-attention between query and spatial features.
 
-    The text embedding serves as the query, and each spatial feature vector
-    serves as a key. The resulting attention weights form the heatmap.
+    The fused object+text embedding serves as the query, and each spatial
+    feature vector serves as a key. The resulting attention weights form the heatmap.
     """
 
-    def __init__(self, feature_dim: int, text_dim: int = 768):
+    def __init__(self, feature_dim: int, query_dim: int = None):
         super().__init__()
-        # Projection layers to align text and visual dimensions
-        self.visual_proj = nn.Linear(feature_dim, text_dim)
-        self.text_proj = nn.Linear(text_dim, text_dim)
-
-        # Temperature for scaling attention logits
+        query_dim = query_dim or feature_dim
+        self.visual_proj = nn.Linear(feature_dim, query_dim)
+        self.text_proj = nn.Linear(query_dim, query_dim)
         self.temperature = nn.Parameter(torch.tensor(1.0))
+        self.logit_bias = nn.Parameter(torch.tensor(0.0))  # 可学习偏置，提升峰值置信度
 
     def forward(self, spatial_features: torch.Tensor,
                 text_query: torch.Tensor) -> torch.Tensor:
@@ -188,160 +230,230 @@ class CrossAttentionHeatmap(nn.Module):
 
         Args:
             spatial_features: [B, H, W, C_v] from spatial refinement
-            text_query: [B, C_t] text embedding
+            text_query: [B, C_q] fused object+text embedding
 
         Returns:
             [B, H, W] heatmap with values in [0, 1]
         """
         B, H, W, C_v = spatial_features.shape
 
-        # Project to shared dimension
-        visual_keys = self.visual_proj(spatial_features)  # [B, H, W, D]
-        text_q = self.text_proj(text_query)  # [B, D]
+        visual_keys = self.visual_proj(spatial_features)
+        text_q = self.text_proj(text_query)
 
-        # Flatten spatial dimensions
-        visual_keys_flat = visual_keys.reshape(B, H * W, -1)  # [B, HW, D]
+        visual_keys_flat = visual_keys.reshape(B, H * W, -1)
 
-        # Compute attention logits
-        logits = torch.einsum("bd,bnd->bn", text_q, visual_keys_flat)  # [B, HW]
-        logits = logits / self.temperature.clamp(min=0.01)
+        logits = torch.einsum("bd,bnd->bn", text_q, visual_keys_flat)
+        logits = logits / self.temperature.clamp(min=0.01) + self.logit_bias
 
-        # Softmax over spatial positions → probability distribution
-        heatmap_flat = F.softmax(logits, dim=-1)  # [B, HW]
-
-        # Reshape to 2D and upscale to heatmap_res
+        # 使用 sigmoid (每个像素独立预测 [0,1])，不用 softmax (互斥概率分布)
+        # sigmoid + weighted BCE 自然驱动: 峰值区域→1.0, 背景→0.0
+        # logit_bias 让模型自己学习将 logit 上移(提高峰值置信度)
+        # 训练时不做 max 归一化——初始均匀输出除以 max 后全变 1.0 会导致梯度崩溃
+        heatmap_flat = torch.sigmoid(logits)
         heatmap = heatmap_flat.reshape(B, H, W)
 
         return heatmap
 
 
 # ============================================================================
-# Full PlacementHeatmap Module
+# Object-Text Fusion Module (SigLIP aligned space)
+# ============================================================================
+
+class ObjTextFusion(nn.Module):
+    """Fuse SigLIP object visual features with SigLIP text embedding.
+
+    Since both are in the same SigLIP embedding space, fusion is simple:
+    concatenate and project.
+
+    Args:
+        siglip_dim: SigLIP feature dimension (e.g. 1152)
+        output_dim: output dimension for query vector
+    """
+
+    def __init__(self, siglip_dim: int, output_dim: int = None):
+        super().__init__()
+        output_dim = output_dim or siglip_dim
+        self.fusion = nn.Sequential(
+            nn.Linear(siglip_dim * 2, siglip_dim),
+            nn.GELU(),
+            nn.Linear(siglip_dim, output_dim),
+        )
+
+    def forward(self, obj_features: torch.Tensor,
+                text_features: torch.Tensor) -> torch.Tensor:
+        """Fuse object visual and text features.
+
+        Args:
+            obj_features: [B, siglip_dim] SigLIP object visual embedding
+            text_features: [B, siglip_dim] SigLIP text embedding
+
+        Returns:
+            [B, output_dim] fused query vector
+        """
+        combined = torch.cat([obj_features, text_features], dim=-1)
+        return self.fusion(combined)
+
+
+# ============================================================================
+# Full PlacementHeatmap Module (pure SigLIP)
 # ============================================================================
 
 class PlacementHeatmap(nn.Module):
-    """Complete heatmap generation pipeline.
+    """Complete heatmap generation pipeline with pure SigLIP.
 
-    Top View PNG → ViT Encoder → Spatial Refinement → Cross-Attention(text) → Heatmap
-
-    Uses SigLIP (via transformers) for both visual and text encoding.
-    Model weights are cached locally after first download.
+    Architecture:
+        Room Image   -> SigLIP ViT (spatial) -> SpatialRefinement -> Key/Value
+        Object Image -> SigLIP ViT (global) ─┐
+                                             +-> ObjTextFusion -> Query
+        Text         -> SigLIP Text Encoder ─┘
+                                                   |
+                                             CrossAttention -> Heatmap
     """
 
-    MODEL_NAME = "google/siglip-so400m-patch14-384"
+    SIGLIP_MODEL = "google/siglip-so400m-patch14-384"
 
-    def __init__(self, model_name: str = None, heatmap_res: int = 256):
+    def __init__(self, siglip_model: str = None, heatmap_res: int = 256):
         super().__init__()
         self.heatmap_res = heatmap_res
-        model_name = model_name or self.MODEL_NAME
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        siglip_model = siglip_model or self.SIGLIP_MODEL
 
-        # ViT encoder for spatial features
-        self.vit_encoder = SiglipViTEncoder(model_name)
-        feature_dim = self.vit_encoder.feature_dim
+        # SigLIP vision encoder (shared for room spatial + object global)
+        self.vision_encoder = SiglipVisionEncoder(siglip_model)
+        siglip_dim = self.vision_encoder.feature_dim
 
-        # Spatial refinement (windowed self-attention)
+        # SigLIP text encoder
+        self.text_encoder = SiglipTextEncoder(siglip_model)
+
+        # Object-Text fusion (both already in SigLIP space)
+        self.obj_text_fusion = ObjTextFusion(siglip_dim, siglip_dim)
+
+        # Spatial refinement (windowed self-attention on room features)
         self.spatial_refinement = SpatialRefinement(
-            in_channels=feature_dim,
+            in_channels=siglip_dim,
             hidden_dim=256,
             num_heads=8,
-            window_size=8,
         )
 
         # Cross-attention heatmap head
         self.heatmap_head = CrossAttentionHeatmap(
-            feature_dim=feature_dim,
-            text_dim=feature_dim,  # SigLIP text & visual share same dim
+            feature_dim=siglip_dim,
+            query_dim=siglip_dim,
         )
 
-        # SigLIP text encoder
-        from transformers import SiglipTextModel, SiglipTokenizer
-        self.text_model = SiglipTextModel.from_pretrained(model_name).to(device)
-        self.tokenizer = SiglipTokenizer.from_pretrained(model_name)
-        self.text_dim = feature_dim
-
-        # Freeze text encoder too
-        for param in self.text_model.parameters():
-            param.requires_grad = False
-
-        self.text_model.eval()
-
-    @torch.no_grad()
-    def encode_image(self, image_path: str, device: Optional[str] = None) -> torch.Tensor:
-        """Load and preprocess a top-view image, return spatial features.
+    def preprocess_image(self, image_path: str) -> torch.Tensor:
+        """Load and preprocess image for SigLIP.
 
         Args:
-            image_path: path to the top-view PNG
-            device: override device (default: auto-detect)
+            image_path: path to image PNG
 
         Returns:
-            [1, grid_size, grid_size, feature_dim] spatial features
+            [1, 3, H, W] preprocessed tensor
         """
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
+        device = next(self.vision_encoder.model.parameters()).device
         image = Image.open(image_path).convert("RGB")
-        preprocessed = self.vit_encoder.preprocess(image).unsqueeze(0).to(device)
-        return self.vit_encoder(preprocessed)
+        preprocessed = self.vision_encoder.preprocess(image).unsqueeze(0).to(device)
+        return preprocessed
 
-    @torch.no_grad()
-    def encode_text(self, text: str, device: Optional[str] = None) -> torch.Tensor:
-        """Encode object description into a text embedding via SigLIP.
-
-        Args:
-            text: object description (e.g. "bed", "desk lamp")
-
-        Returns:
-            [1, text_dim] text embedding (normalized)
-        """
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        inputs = self.tokenizer([text], padding="max_length",
-                                truncation=True, return_tensors="pt").to(device)
-        outputs = self.text_model(**inputs)
-        text_features = outputs.pooler_output  # [1, text_dim]
-        text_features = F.normalize(text_features.float(), p=2, dim=-1)
-        return text_features
-
-    def forward(self, image_path: str, object_desc: str,
-                device: Optional[str] = None) -> torch.Tensor:
+    def forward(self, room_image_path: str, object_desc: str,
+                object_image_path: Optional[str] = None) -> torch.Tensor:
         """Generate placement heatmap for an object in a room.
 
         Args:
-            image_path: path to the top-view PNG of the room
+            room_image_path: path to the room top-view PNG (without target object)
             object_desc: text description of the object to place
+            object_image_path: path to the object reference PNG
 
         Returns:
             [H, W] heatmap tensor with values in [0, 1], upscaled to heatmap_res
         """
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Stage 1: ViT encode top view → spatial features
-        spatial_features = self.encode_image(image_path, device)  # [1, g, g, C]
+        # Stage 1: SigLIP encode room top view -> spatial features
+        room_tensor = self.preprocess_image(room_image_path)
+        spatial_features = self.vision_encoder.encode_spatial(room_tensor)  # [1, g, g, C]
 
         # Stage 2: Spatial refinement (self-attention)
         spatial_features = self.spatial_refinement(spatial_features)
 
-        # Stage 3: Text encoding
-        text_features = self.encode_text(object_desc, device)  # [1, text_dim]
+        # Stage 3: SigLIP encode object image + text
+        if object_image_path:
+            obj_tensor = self.preprocess_image(object_image_path)
+            obj_features = self.vision_encoder.encode_global(obj_tensor)  # [1, C]
+        else:
+            # If no object image, use zeros
+            device = next(self.vision_encoder.model.parameters()).device
+            obj_features = torch.zeros(1, self.vision_encoder.feature_dim, device=device)
 
-        # Stage 4: Cross-attention → heatmap at ViT patch resolution
-        heatmap_low = self.heatmap_head(spatial_features, text_features)  # [1, g, g]
+        text_features = self.text_encoder.encode(object_desc)  # [1, C]
 
-        # Stage 5: Upsample to target heatmap resolution
+        # Stage 4: Object-Text fusion -> query
+        query = self.obj_text_fusion(obj_features, text_features)  # [1, C]
+
+        # Stage 5: Cross-attention -> heatmap at ViT patch resolution
+        heatmap_low = self.heatmap_head(spatial_features, query)  # [1, g, g]
+
+        # Stage 6: Upsample to target heatmap resolution
         heatmap = F.interpolate(
-            heatmap_low.unsqueeze(0),  # [1, 1, g, g]
+            heatmap_low.unsqueeze(0),
             size=(self.heatmap_res, self.heatmap_res),
             mode='bilinear',
             align_corners=False,
-        ).squeeze(0).squeeze(0)  # [H, W]
+        ).squeeze(0).squeeze(0)
 
         # Normalize to [0, 1]
         if heatmap.max() > 0:
             heatmap = heatmap / heatmap.max()
+
+        return heatmap
+
+    def forward_tensor(
+        self,
+        room_image: torch.Tensor,
+        object_desc: str,
+        object_image: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Generate placement heatmap from tensor inputs (for training).
+
+        Args:
+            room_image: [B, 3, H, W] preprocessed room image tensor
+            object_desc: text description of the object to place
+            object_image: [B, 3, H, W] preprocessed object image tensor (optional)
+
+        Returns:
+            [B, heatmap_res, heatmap_res] heatmap tensor with values in [0, 1]
+        """
+        # Stage 1: SigLIP encode room top view -> spatial features
+        spatial_features = self.vision_encoder.encode_spatial(room_image)  # [B, g, g, C]
+
+        # Stage 2: Spatial refinement (self-attention)
+        spatial_features = self.spatial_refinement(spatial_features)
+
+        # Stage 3: SigLIP encode object image + text
+        if object_image is not None:
+            obj_features = self.vision_encoder.encode_global(object_image)  # [B, C]
+        else:
+            # If no object image, use zeros
+            device = next(self.vision_encoder.model.parameters()).device
+            B = room_image.size(0)
+            obj_features = torch.zeros(B, self.vision_encoder.feature_dim, device=device)
+
+        text_features = self.text_encoder.encode(object_desc)  # [1, C]
+        # Broadcast text features to match batch size
+        if text_features.size(0) != room_image.size(0):
+            text_features = text_features.expand(room_image.size(0), -1)
+
+        # Stage 4: Object-Text fusion -> query
+        query = self.obj_text_fusion(obj_features, text_features)  # [B, C]
+
+        # Stage 5: Cross-attention -> heatmap at ViT patch resolution
+        heatmap_low = self.heatmap_head(spatial_features, query)  # [B, g, g]
+
+        # Stage 6: Upsample to target heatmap resolution
+        heatmap = F.interpolate(
+            heatmap_low.unsqueeze(1),  # [B, 1, g, g]
+            size=(self.heatmap_res, self.heatmap_res),
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(1)  # [B, H, W]
 
         return heatmap
 
@@ -354,10 +466,11 @@ class PlacementEngine:
     """High-level placement engine that combines heatmap and feasibility mask.
 
     Usage:
-        engine = PlacementEngine()
+        engine = PlacementEngine(heatmap_model=model)
         position = engine.place_object(
             scene=scene_json,
             top_view_path="path/to/top_view.png",
+            object_image_path="path/to/object_ref.png",
             object_desc="bed",
             size=[1.8, 0.8, 2.1],
             rotation=[0, 0, 0, 1],
@@ -368,74 +481,71 @@ class PlacementEngine:
     def __init__(self, heatmap_res: int = 256,
                  heatmap_model: Optional[PlacementHeatmap] = None,
                  enable_heatmap: bool = True):
-        """
-        Args:
-            heatmap_res: grid resolution
-            heatmap_model: pre-loaded PlacementHeatmap module, or None for
-                          uniform heatmap (no learning)
-            enable_heatmap: if False, skip heatmap and use uniform scores
-        """
         self.heatmap_res = heatmap_res
         self.enable_heatmap = enable_heatmap
         self.heatmap_model = heatmap_model
 
-    def compute_heatmap(self, top_view_path: str,
-                        object_desc: str) -> np.ndarray:
+    def compute_heatmap(self, room_image_path: str, object_desc: str,
+                        object_image_path: str) -> torch.Tensor:
         """Compute the learning-based heatmap for a given object.
 
+        Args:
+            room_image_path: path to the room top-view PNG
+            object_desc: text description of the object
+            object_image_path: path to the object reference PNG
+
         Returns:
-            numpy array [heatmap_res, heatmap_res] with values in [0, 1].
+            [heatmap_res, heatmap_res] heatmap tensor with values in [0, 1].
         """
         if not self.enable_heatmap or self.heatmap_model is None:
-            # Fallback: uniform heatmap (position decided purely by mask)
-            return np.ones((self.heatmap_res, self.heatmap_res), dtype=np.float32)
+            return torch.ones(self.heatmap_res, self.heatmap_res)
 
         self.heatmap_model.eval()
         with torch.no_grad():
-            heatmap = self.heatmap_model(top_view_path, object_desc)
-        return heatmap.cpu().numpy()
+            heatmap = self.heatmap_model(room_image_path, object_desc, object_image_path)
+        return heatmap
 
     def place_object(self, scene: dict, top_view_path: str,
                      object_desc: str, size: list,
                      rotation: list = None,
                      placement_plane: str = "floor",
-                     clearance: float = 0.5) -> Optional[list]:
+                     clearance: float = 0.5,
+                     object_image_path: Optional[str] = None) -> Optional[list]:
         """Compute the optimal placement position for an object.
 
         Args:
             scene: scene JSON data
-            top_view_path: path to top-view PNG
+            top_view_path: path to room top-view PNG
             object_desc: text description of the object
             size: [width, height, depth]
-            rotation: [x, y, z, w] quaternion (used for collision mask)
+            rotation: [x, y, z, w] quaternion
             placement_plane: "floor" or target object jid
             clearance: minimum clearance around existing objects
+            object_image_path: path to object reference PNG (optional)
 
         Returns:
             [x, y, z] placement position, or None if no feasible position found.
         """
         from utils.placement_mask import compute_mask, find_best_position
 
-        # Step 1: Compute feasibility mask
         mask, ortho_scale, cx, cz = compute_mask(
             scene, self.heatmap_res, clearance, placement_plane
         )
 
-        if not np.any(mask):
+        if not torch.any(mask):
             print(f"[placement] No feasible position for '{object_desc}'")
             return None
 
-        # Step 2: Compute learning-based heatmap
-        heatmap = self.compute_heatmap(top_view_path, object_desc)
+        if object_image_path is not None:
+            heatmap = self.compute_heatmap(top_view_path, object_desc, object_image_path)
+        else:
+            heatmap = torch.ones(self.heatmap_res, self.heatmap_res)
 
-        # Step 3: Fuse heatmap × mask
-        score = heatmap * mask.astype(np.float32)
+        score = heatmap * mask.float()
 
-        if not np.any(score > 0):
-            # Heatmap disagrees with all feasible positions, fallback to mask
-            score = mask.astype(np.float32)
+        if not torch.any(score > 0):
+            score = mask.float()
 
-        # Step 4: Extract best position
         positions = find_best_position_from_score(
             score, ortho_scale, cx, cz, self.heatmap_res,
             placement_plane, scene, top_k=1
@@ -449,21 +559,21 @@ class PlacementEngine:
         return positions[0]
 
 
-def find_best_position_from_score(score: np.ndarray, ortho_scale: float,
+def find_best_position_from_score(score: torch.Tensor, ortho_scale: float,
                                   cx: float, cz: float, heatmap_res: int,
                                   placement_plane: str = "floor",
                                   scene: Optional[dict] = None,
                                   top_k: int = 1,
                                   min_distance: float = 0.5) -> list:
-    """Extract top-k positions from a fused score field (heatmap × mask).
+    """Extract top-k positions from a fused score field (heatmap x mask).
 
     Args:
-        score: 2D float array [heatmap_res, heatmap_res]
+        score: 2D float tensor [heatmap_res, heatmap_res]
         ortho_scale: orthographic scale in meters
         cx, cz: room center
         heatmap_res: grid resolution
         placement_plane: "floor" or object jid
-        scene: optional scene data (for Y height when placing on object)
+        scene: optional scene data
         top_k: number of candidates
         min_distance: minimum distance between candidates
 
@@ -472,18 +582,17 @@ def find_best_position_from_score(score: np.ndarray, ortho_scale: float,
     """
     from utils.placement_mask import grid_to_world, _extract_objects
 
-    if not np.any(score > 0):
+    if not torch.any(score > 0):
         return []
 
     positions = []
-    working_score = score.copy()
+    working_score = score.clone()
 
     for _ in range(top_k):
-        idx = np.argmax(working_score.ravel())
+        idx = torch.argmax(working_score.flatten()).item()
         gi, gj = divmod(idx, heatmap_res)
         x, z = grid_to_world(gi, gj, cx, cz, ortho_scale, heatmap_res)
 
-        # Y coordinate
         if placement_plane == "floor":
             y = 0.0
         else:
@@ -500,7 +609,6 @@ def find_best_position_from_score(score: np.ndarray, ortho_scale: float,
 
         positions.append([float(x), float(y), float(z)])
 
-        # Suppress neighborhood
         cell_size = ortho_scale / heatmap_res
         radius_cells = max(1, int(min_distance / cell_size))
         y1 = max(0, gi - radius_cells)
@@ -512,54 +620,40 @@ def find_best_position_from_score(score: np.ndarray, ortho_scale: float,
     return positions
 
 
-def visualize_placement(score: np.ndarray, top_view_path: str,
+def visualize_placement(score: torch.Tensor, top_view_path: str,
                         positions: list, object_desc: str,
                         ortho_scale: float, cx: float, cz: float,
                         heatmap_res: int, save_path: str) -> None:
-    """Create a debug visualization overlaying the score field on the top view.
-
-    Args:
-        score: 2D float array [heatmap_res, heatmap_res] — fused score
-        top_view_path: path to the top-view PNG
-        positions: list of [x, y, z] positions (argmax candidates)
-        object_desc: object description
-        ortho_scale: Blender orthographic scale
-        cx, cz: room center
-        heatmap_res: grid resolution
-        save_path: output PNG path
-    """
+    """Create a debug visualization overlaying the score field on the top view."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from PIL import Image
+    import numpy as np
 
-    # Load top view
     top_img = Image.open(top_view_path).convert('RGB')
 
-    # Resize score to match top view resolution
+    score_np = score.cpu().numpy()
     score_resized = np.array(Image.fromarray(
-        (score * 255).astype(np.uint8)
+        (score_np * 255).astype(np.uint8)
     ).resize((top_img.width, top_img.height), Image.BILINEAR)) / 255.0
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 10))
     ax.imshow(top_img)
 
-    # Overlay score heatmap as semi-transparent colormap
     cmap = plt.cm.jet
     heatmap_rgba = cmap(score_resized)
-    heatmap_rgba[..., 3] = 0.4  # 40% opacity
+    heatmap_rgba[..., 3] = 0.4
     ax.imshow(heatmap_rgba)
 
-    # Mark best positions with red dots
     for i, pos in enumerate(positions):
         px, pz = pos[0], pos[2]
-        # Convert world coords to pixel coords (linear ortho mapping)
         u = ((px - cx) / ortho_scale + 0.5) * top_img.width
-        v = ((cz - pz) / ortho_scale + 0.5) * top_img.height
+        v = ((pz - cz) / ortho_scale + 0.5) * top_img.height
         ax.plot(u, v, 'rX', markersize=15, linewidth=2,
                 label=f'#{i+1} ({px:.2f}, {pz:.2f})' if i == 0 else f'#{i+1}')
 
-    ax.set_title(f'Placement: "{object_desc}"\nScore = Heatmap × FeasibleMask')
+    ax.set_title(f'Placement: "{object_desc}"\nScore = Heatmap x FeasibleMask')
     ax.legend(loc='upper right', fontsize=8)
     ax.axis('off')
 
