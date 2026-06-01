@@ -2,8 +2,15 @@
 """
 SceneReVis 热力图训练数据生成 CLI
 
-用法:
-  python generate_data.py --config config.yaml
+使用流程:
+  # Phase 1: 渲染所有场景 (CPU, 不需要 GPU)
+  python generate_data.py --config config.yaml --phase 1
+
+  # Phase 2: 批量 VLM 描述生成 (需要 GPU)
+  python generate_data.py --config config.yaml --phase 2
+
+  # 或一次性跑完两阶段
+  python generate_data.py --config config.yaml --phase all
 """
 import sys
 import argparse
@@ -31,6 +38,11 @@ def main():
         help="配置文件路径 (YAML)"
     )
     parser.add_argument(
+        "--phase", type=str, default="all",
+        choices=["1", "2", "all"],
+        help="执行阶段: 1=渲染, 2=VLM描述, all=两阶段 (默认 all)"
+    )
+    parser.add_argument(
         "--scene-dir", type=str, default=None,
         help="覆盖配置中的 scene_dir"
     )
@@ -45,6 +57,10 @@ def main():
     parser.add_argument(
         "--max-objects", type=int, default=None,
         help="覆盖配置中的 max_object_nums"
+    )
+    parser.add_argument(
+        "--vlm-batch-size", type=int, default=256,
+        help="Phase 2 VLM 批量推理批次大小（默认 256，减小可避免 OOM）"
     )
 
     args = parser.parse_args()
@@ -74,7 +90,14 @@ def main():
         sys.exit(1)
 
     generator = HeatmapDataGenerator(config)
-    generator.run()
+
+    if args.phase == "1":
+        generator.run_phase1()
+    elif args.phase == "2":
+        generator.run_phase2(vlm_batch_size=args.vlm_batch_size)
+    else:  # all
+        generator.run_phase1()
+        generator.run_phase2(vlm_batch_size=args.vlm_batch_size)
 
 
 if __name__ == "__main__":

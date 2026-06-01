@@ -1,16 +1,19 @@
 # 热力图放置模型训练指南
 
-本目录包含 SceneReVis 热力图放置模型的完整数据准备和训练流程。
+本目录包含 SceneReVis 热力图放置模型的完整数据准备、训练和可视化流程。
 
 ## 架构概述
 
-模型使用 **SigLIP + CLIP** 双编码器架构：
+模型使用 **纯 SigLIP** 单编码器架构，同时处理房间空间、物体视觉和文本语义：
 
-- **SigLIP ViT** (`google/siglip-so400m-patch14-384`): 编码房间俯视图，提取空间特征 (27×27 网格, 1152 维)
-- **CLIP ViT-L-14** (`openai/clip-vit-large-patch14`): 编码物体参考图和文本描述 (768 维对齐特征)
-- **融合层**: 将 CLIP 特征拼接后投影到 SigLIP 维度
-- **交叉注意力**: 以融合后的物体+文本特征为 query，房间空间特征为 key/value
-- **热力图头**: 输出 256×256 的放置概率热力图
+- **SigLIP ViT** (`google/siglip-so400m-patch14-384`): 统一编码器
+  - 房间俯视图 → 27×27 空间特征网格 (1152 维)
+  - 物体参考图 → 全局物体特征 (1152 维)
+  - 文本描述 → 文本特征 (1152 维)
+- **特征融合**: 物体特征 + 文本特征拼接后投影到 1152 维
+- **全局自注意力 (SpatialRefinement)**: 27×27 = 729 个 token 做全局自注意力，捕捉长距离空间依赖
+- **交叉注意力**: 房间空间特征为 Query，物体+文本融合特征为 Key，每个空间位置评估 "我这里适合放置该物体吗"
+- **热力图头**: 输出 256×256 的放置概率热力图 (sigmoid + 可学习 logit_bias)
 
 ## 数据准备
 
@@ -35,11 +38,14 @@ python generate_data.py \
 **配置项** (`config.yaml`):
 - `data.scene_dir`: 场景 JSON 目录
 - `data.model_dir`: 3D-FUTURE 模型文件目录
+- `data.metadata_dir`: 元数据 JSON 目录 (默认 `model_dir/../metadata`)
 - `data.output_dir`: 输出目录
 - `generation.image_size`: 图像分辨率 (默认 1024)
 - `generation.heatmap_sigma`: 高斯热力图 sigma (默认 15 像素)
+- `generation.adaptive_sigma`: 是否使用物体尺寸自适应 sigma (默认 false)
 - `generation.max_object_nums`: 每个场景最多处理物体数 (默认 5)
-- `generation.text.augmentation_prob`: 文本增强概率 (默认 0.5)
+- `generation.text.*`: 文本增强配置
+- `generation.vlm.*`: VLM 描述生成配置 (见下方 [VLM 描述生成](#vlm-描述生成))
 
 **输出结构**:
 ```
@@ -51,8 +57,10 @@ output/heatmap_data/
 │       │   └── obj_xxx.png
 │       ├── object_images/         # 物体参考图 (居中)
 │       │   └── obj_xxx_object.png
-│       └── masks/                 # GT 热力图
-│           └── obj_xxx_mask.png
+│       ├── masks/                 # GT 热力图
+│       │   └── obj_xxx_mask.png
+│       └── original_images/       # 完整场景俯视图 (仅 VLM 启用时)
+│           └── obj_xxx_original.png
 ├── val/
 │   ├── val.json
 │   └── ...
@@ -71,10 +79,46 @@ output/heatmap_data/
     "object_image_path": "object_images/obj_xxx_object.png",
     "mask_path": "masks/obj_xxx_mask.png",
     "object_desc": "a wooden chair with armrests",
-    "split": "train"
+    "split": "train",
+    "scene_name": "scene_001",
+    "text_source": "text_processor",
+    "original_image_path": "original_images/obj_xxx_original.png",
+    "removed_object": {
+      "jid": "abc123",
+      "model_id": "abc123",
+      "desc": "椅子",
+      "pos": [1.5, 0.0, 3.2],
+      "rot": [0, 0.707, 0, 0.707],
+      "size": [0.5, 0.8, 0.9]
+    }
   }
 ]
 ```
+
+**字段说明**:
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `sample_id` | str | 是 | 样本唯一标识 (`obj_{jid}`) |
+| `scene_dir` | str | 是 | 场景相对路径 (`{split}/{scene_name}`) |
+| `plane_image_path` | str | 是 | 房间俯视图 (剔除目标物体) |
+| `object_image_path` | str | 是 | 物体参考图 (居中渲染) |
+| `mask_path` | str | 是 | GT 高斯热力图 (灰度) |
+| `object_desc` | str | 是 | 物体描述 (TextProcessor 或 VLM 生成) |
+| `split` | str | 是 | 数据集划分 (train/val/test) |
+| `scene_name` | str | 否 | 场景名称 |
+| `text_source` | str | 是 | 描述来源: `"text_processor"` 或 `"vlm"` |
+| `original_image_path` | str | 否 | 完整场景俯视图 (仅 VLM 启用时存在) |
+| `removed_object` | dict | 否 | 被移除物体的 3D 元数据 (见下) |
+
+**removed_object 字段**:
+| 字段 | 说明 |
+|------|------|
+| `jid` | 物体实例 ID |
+| `model_id` | 3D-FUTURE 模型 ID |
+| `desc` | 原始简短描述 |
+| `pos` | 世界坐标位置 `[x, y, z]` |
+| `rot` | 四元数旋转 `[x, y, z, w]` |
+| `size` | 包围盒尺寸 `[w, h, d]` |
 
 ### 2. 数据组件
 
@@ -89,6 +133,7 @@ output/heatmap_data/
   - `model_info_3dfuture_assets.json`: summary
   - `model_info_3dfuture_assets_prompts.json`: 多变体描述
   - `model_info_3dfuture_assets_simple_descs.json`: 简单分类
+- **VLMClient**: 使用 Qwen3-VL 生成摆放位置描述 (可选)
 - **SampleSaver**: 保存图片和元数据 JSON
 
 ### 3. 测试数据生成
@@ -102,26 +147,111 @@ data_dir = Path('./output/heatmap_data/train')
 with open(data_dir / 'train.json') as f:
     samples = json.load(f)
 print(f'训练样本数: {len(samples)}')
-print(f'示例: {samples[0]}')
+print(f'示例: {json.dumps(samples[0], indent=2, ensure_ascii=False)}')
 "
 ```
 
-## 模型测试
+## VLM 描述生成
 
-### 验证前向传播
+启用 VLM 后，使用 Qwen3-VL 对比 3 张图生成中文摆放描述，比 TextProcessor 的静态描述信息更丰富。
+
+### 工作流程
+
+1. 渲染完整场景俯视图 (每个场景只渲染一次)
+2. 对每个目标物体: 渲染剔除后房间 + 物体参考图
+3. 将 3 张图送入 Qwen3-VL，生成描述 (如 "请你将[床]摆放在房间左侧靠墙的位置...")
+4. VLM 失败时自动回退到 TextProcessor
+
+### 启用配置
+
+```yaml
+generation:
+  vlm:
+    enabled: true
+    model_path: "/path/to/Qwen3-VL"
+    backend: "vllm"        # "vllm" (快) 或 "transformers" (回退)
+    max_tokens: 256
+    temperature: 0.7
+    cache_enabled: true    # 磁盘缓存，避免重复生成
+```
+
+### 向后兼容
+
+- `vlm.enabled: false` (默认): 输出与不使用 VLM 时完全一致
+- 旧 JSON + 新代码: 新字段不存在时自动跳过 (`if key in sample`)
+- 新 JSON + 旧代码: 多余字段被忽略
+- **模型代码 (`placement_heatmap.py`) 零改动**: SigLIP text encoder 不关心文本来源
+
+## 训练
+
+### 使用训练脚本
 
 ```bash
 cd script/pretreatment
-python test_forward.py
+
+# 基础训练
+python train_heatmap.py \
+  --data_dir /path/to/heatmap_data \
+  --output_dir checkpoints/heatmap \
+  --epochs 100 \
+  --batch_size 4 \
+  --lr 1e-4
+
+# 快速测试学习率 (1 epoch 内 cosine 衰减)
+python train_heatmap.py \
+  --data_dir /path/to/heatmap_data \
+  --output_dir checkpoints/test_lr_1e-4 \
+  --lr 1e-4 \
+  --test_lr
+
+# 恢复训练
+python train_heatmap.py \
+  --data_dir /path/to/heatmap_data \
+  --output_dir checkpoints/heatmap \
+  --epochs 100 \
+  --lr 1e-4 \
+  --resume checkpoints/heatmap/latest.pth
 ```
 
-测试内容：
-- 模型初始化
-- 单样本前向传播
-- 批量前向传播
-- 输出验证 (形状、值域)
+**训练参数**:
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--data_dir` | (必填) | 数据目录 |
+| `--output_dir` | `checkpoints/heatmap` | 检查点输出目录 |
+| `--epochs` | 100 | 训练轮数 |
+| `--batch_size` | 4 | 批量大小 |
+| `--lr` | 1e-4 | 初始学习率 |
+| `--weight_decay` | 1e-4 | 权重衰减 |
+| `--image_size` | 384 | 图像分辨率 (匹配 SigLIP 输入) |
+| `--num_workers` | 4 | 数据加载线程数 |
+| `--resume` | None | 恢复训练的检查点路径 |
+| `--test_lr` | false | LR 测试模式: 1 epoch 内 cosine 衰减 |
 
-## 数据集加载
+**学习率调度**: CosineAnnealingLR (`eta_min=1e-6`)
+- 正常模式: 按 epoch 衰减
+- `--test_lr` 模式: 按 batch 衰减，1 epoch 内完成扫描
+
+**损失函数**: 加权 Binary Cross Entropy
+```python
+loss = F.binary_cross_entropy(
+    pred_heatmap, mask_resized,
+    weight=torch.where(
+        mask_resized > 0.1,
+        torch.tensor(10.0),  # 峰值区域 10 倍权重
+        torch.tensor(1.0),
+    ),
+)
+```
+
+**进度条指标**:
+```
+Epoch 1 [Train]: 39%|...| loss=0.0495, avg=0.0779, peak=25%, hm=[0.00,0.59], lr=1.0e-04
+```
+- `loss`: 当前 batch 损失
+- `avg`: 累计平均损失
+- `peak`: 峰值准确率 (预测峰值与 GT 峰值距离 < 32px)
+- `hm`: 预测热力图值域 `[min, max]`
+- `lr`: 当前学习率
 
 ### 使用 PyTorch Dataset
 
@@ -130,7 +260,6 @@ from script.pretreatment.dataset import HeatmapPlacementDataset, collate_fn
 from torch.utils.data import DataLoader
 from pathlib import Path
 
-# 创建数据集
 dataset = HeatmapPlacementDataset(
     data_dir=Path("./output/heatmap_data"),
     split="train",
@@ -139,7 +268,6 @@ dataset = HeatmapPlacementDataset(
     normalize=True,
 )
 
-# 创建 DataLoader
 loader = DataLoader(
     dataset,
     batch_size=4,
@@ -148,109 +276,44 @@ loader = DataLoader(
     num_workers=4,
 )
 
-# 训练循环
 for batch in loader:
     room_images = batch["room_image"]       # (B, 3, 1024, 1024)
     object_images = batch["object_image"]   # (B, 3, 1024, 1024)
     masks = batch["mask"]                   # (B, 1, 256, 256)
     descs = batch["object_desc"]            # list of str
-    
-    # 前向传播
-    # heatmaps = model(room_images, descs, object_images)
-    # loss = criterion(heatmaps, masks)
-    # ...
+    # 可选新字段:
+    # batch["scene_name"]                   # list of str
+    # batch["text_source"]                  # list of str
+    # batch["removed_object"]               # list of dict
 ```
 
-### 测试数据集加载
+## 可视化
+
+### 可视化训练结果
 
 ```bash
-python dataset.py --data_dir ./output/heatmap_data --split train
+python visualize_results.py \
+  --data_dir /path/to/heatmap_data \
+  --checkpoint checkpoints/heatmap/latest.pth \
+  --num_samples 10 \
+  --output_dir visualizations \
+  --split val
 ```
 
-## 训练
+输出 **2×4 布局** 的对比图:
 
-### 基础训练脚本 (示例)
+| 位置 | 内容 |
+|------|------|
+| [1,1] | 原始完整场景 (含所有物体，VLM 未启用时显示 N/A) |
+| [1,2] | 房间俯视图 (剔除目标物体后) |
+| [1,3] | 物体参考图 |
+| [1,4] | GT 热力图 + 峰值标记 |
+| [2,1] | 预测热力图 + 峰值标记 |
+| [2,2] | GT 摆放位置叠加 (房间 + 热力图 + 圆圈) |
+| [2,3] | 预测摆放位置叠加 |
+| [2,4] | 预测 vs GT 对比 (蓝/红圆圈 + 黄色连接线) |
 
-```python
-import torch
-from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from pathlib import Path
-
-from script.pretreatment.dataset import HeatmapPlacementDataset, collate_fn
-from utils.placement_heatmap import PlacementHeatmap
-
-# 数据
-train_dataset = HeatmapPlacementDataset(
-    data_dir=Path("./output/heatmap_data"),
-    split="train",
-)
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=4,
-    shuffle=True,
-    collate_fn=collate_fn,
-    num_workers=4,
-)
-
-# 模型
-model = PlacementHeatmap(device="cuda")
-
-# 优化器
-optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-
-# 损失函数
-criterion = torch.nn.MSELoss()
-
-# 训练循环
-for epoch in range(100):
-    for batch in train_loader:
-        room_images = batch["room_image"].to(model.device)
-        object_images = batch["object_image"].to(model.device)
-        masks = batch["mask"].to(model.device)
-        descs = batch["object_desc"]
-        
-        # 前向传播
-        heatmaps = model(room_images, descs, object_images)
-        
-        # 计算损失
-        loss = criterion(heatmaps, masks)
-        
-        # 反向传播
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
-```
-
-## 推理
-
-### 使用 PlacementEngine
-
-```python
-from utils.placement_heatmap import PlacementEngine
-
-# 加载训练好的模型
-engine = PlacementEngine(
-    checkpoint_path="checkpoints/heatmap_model.pth",
-    device="cuda"
-)
-
-# 放置物体
-result = engine.place_object(
-    room_image_path="path/to/room.png",
-    object_desc="a wooden chair",
-    object_image_path="path/to/chair.png",
-    bounds_bottom=[...],  # 房间边界
-    top_k=5,  # 返回 top-k 个候选位置
-)
-
-# 结果
-positions = result["positions"]  # list of (x, y, z) 世界坐标
-scores = result["scores"]        # list of float 置信度
-heatmap = result["heatmap"]      # numpy array (256, 256)
-```
+标题格式: `[scene_name] (text_source) object_desc`
 
 ## 关键设计
 
@@ -275,12 +338,12 @@ heatmap[gi=X, gj=Z]
 
 无需在推理时翻转轴。
 
-### CLIP 特征对齐
+### SigLIP 特征统一
 
-CLIP 的视觉和文本编码器已经在同一特征空间中预训练，因此：
-- 物体图像特征: `clip.encode_image(object_image)` → 768 维
-- 文本特征: `clip.encode_text(description)` → 768 维
-- 拼接后投影到 SigLIP 维度 (1152)
+所有输入使用同一 SigLIP 编码器：
+- 房间图像: `siglip.encode(room_image)` → 27×27×1152 空间特征
+- 物体图像: `siglip.encode(object_image)` → 1152 维全局特征
+- 文本描述: `siglip.encode_text(description)` → 1152 维文本特征
 
 ## 故障排除
 
@@ -288,26 +351,33 @@ CLIP 的视觉和文本编码器已经在同一特征空间中预训练，因此
 
 - 减小 `batch_size`
 - 使用梯度累积
-- 冻结 SigLIP/CLIP 编码器，只训练融合层和热力图头
+- 冻结 SigLIP 编码器，只训练融合层和热力图头
 
 ### 训练不稳定
 
 - 降低学习率 (从 1e-4 降到 1e-5)
-- 使用 warmup 调度器
+- 使用 `--test_lr` 快速扫描合适的学习率
 - 增加 `heatmap_sigma` 使 GT 更平滑
+
+### 热力图值域异常
+
+- `hm=[1.00,1.00]`: 模型输出均匀 → 检查是否误加了 max 归一化
+- `hm=[0.00,0.00]`: logit_bias 过负 → 检查学习率是否过大
 
 ### 数据加载慢
 
 - 增加 `num_workers`
 - 使用 SSD 存储
-- 预处理图像到更小分辨率 (如 512×512)
+- 预处理图像到更小分辨率 (如 384×384)
 
 ## 文件列表
 
 - `generate_data.py`: 数据生成入口
 - `data_generator.py`: 数据生成器主类
 - `config.yaml`: 数据生成配置
+- `train_heatmap.py`: 训练脚本 (含 `--test_lr` 模式)
 - `dataset.py`: PyTorch Dataset 类
+- `visualize_results.py`: 训练结果可视化
 - `test_forward.py`: 模型前向传播测试
 - `components/`:
   - `scene_builder.py`: 场景构建
@@ -315,4 +385,5 @@ CLIP 的视觉和文本编码器已经在同一特征空间中预训练，因此
   - `heatmap_generator.py`: GT 热力图生成
   - `sample_saver.py`: 样本保存
   - `text_processor.py`: 文本增强
+  - `vlm_client.py`: VLM 描述生成 (Qwen3-VL)
 - `models.py`: 数据结构定义

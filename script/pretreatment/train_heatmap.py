@@ -101,13 +101,20 @@ class HeatmapDataset(Dataset):
         # 文本描述
         object_desc = sample["object_desc"]
 
-        return {
+        result = {
             "room_image": room_tensor,       # [3, H, W]
             "object_image": object_tensor,   # [3, H, W]
             "mask": mask_tensor,             # [1, H, W]
             "object_desc": object_desc,
             "sample_id": sample["sample_id"],
         }
+
+        # 透传新增的可选元数据字段 (scene_name, removed_object, text_source)
+        for key in ("scene_name", "removed_object", "text_source"):
+            if key in sample:
+                result[key] = sample[key]
+
+        return result
 
 
 # ============================================================================

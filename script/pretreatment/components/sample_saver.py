@@ -37,6 +37,10 @@ class SampleSaver:
         object_desc: str,
         object_image: Optional[np.ndarray] = None,
         split: str = "train",
+        scene_name: Optional[str] = None,
+        original_image: Optional[np.ndarray] = None,
+        removed_object: Optional[Dict] = None,
+        text_source: str = "text_processor",
     ):
         """保存单个训练样本
 
@@ -48,6 +52,10 @@ class SampleSaver:
             object_desc: 物体描述文本
             object_image: 物体参考图 RGB (H, W, 3)，可选
             split: 数据集划分
+            scene_name: 场景名称，可选
+            original_image: 完整场景俯视图 RGB (H, W, 3)，可选 (VLM 启用时)
+            removed_object: 被移除物体的 3D 信息字典，可选
+            text_source: 文本来源 ("vlm" 或 "text_processor")
         """
         self.sample_counter += 1
         sample_id = f"obj_{obj_id}"
@@ -75,6 +83,14 @@ class SampleSaver:
         if object_image is not None:
             Image.fromarray(object_image).save(object_path)
 
+        # 保存完整场景俯视图 (可选)
+        original_path = None
+        if original_image is not None:
+            original_dir = scene_dir / "original_images"
+            original_dir.mkdir(parents=True, exist_ok=True)
+            original_path = original_dir / f"{sample_id}_original.png"
+            Image.fromarray(original_image).save(original_path)
+
         # 记录元数据
         metadata = {
             "sample_id": sample_id,
@@ -86,6 +102,14 @@ class SampleSaver:
         }
         if object_image is not None:
             metadata["object_image_path"] = f"object_images/{sample_id}_object.png"
+        if scene_name is not None:
+            metadata["scene_name"] = scene_name
+        if original_image is not None:
+            metadata["original_image_path"] = f"original_images/{sample_id}_original.png"
+        if removed_object is not None:
+            metadata["removed_object"] = removed_object
+        metadata["text_source"] = text_source
+
         self.samples_by_split[split].append(metadata)
 
     def save_split_json(self, split_name: str) -> int:

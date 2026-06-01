@@ -30,3 +30,11 @@ generation:
     use_prompts: true          # 使用 model_info_3dfuture_assets_prompts.json 中的多变体
     use_simple_descs: true     # 使用 model_info_3dfuture_assets_simple_descs.json
     augmentation_prob: 0.5     # 文本增强概率 (随机选择不同描述)
+  # VLM 描述生成配置 (使用 Qwen3-VL 生成摆放位置描述)
+  vlm:
+    enabled: true             # 是否启用 VLM 描述生成 (默认关闭，使用 TextProcessor)
+    model_path: "/mnt/f/models/qwen3_vl"             # Qwen3-VL 模型路径
+    backend: "vllm"            # 推理后端: "vllm" 或 "transformers"
+    max_tokens: 256            # 最大生成 token 数
+    temperature: 0.7           # 采样温度
+    cache_enabled: true        # 是否启用磁盘缓存 (避免重复生成)

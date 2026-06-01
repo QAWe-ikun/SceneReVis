@@ -103,13 +103,20 @@ class HeatmapPlacementDataset(Dataset):
         object_image = torch.from_numpy(object_image.transpose(2, 0, 1)).float()
         mask = torch.from_numpy(mask).float().unsqueeze(0)  # (1, H, W)
 
-        return {
+        result = {
             "room_image": room_image,
             "object_image": object_image,
             "mask": mask,
             "object_desc": sample["object_desc"],
             "sample_id": sample["sample_id"],
         }
+
+        # 透传新增的可选元数据字段 (scene_name, removed_object, text_source)
+        for key in ("scene_name", "removed_object", "text_source"):
+            if key in sample:
+                result[key] = sample[key]
+
+        return result
 
     def _load_image(self, path: Path, target_size: int) -> np.ndarray:
         """加载 RGB 图像并调整尺寸
@@ -148,13 +155,20 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             - object_desc: list of str
             - sample_id: list of str
     """
-    return {
+    result = {
         "room_image": torch.stack([b["room_image"] for b in batch]),
         "object_image": torch.stack([b["object_image"] for b in batch]),
         "mask": torch.stack([b["mask"] for b in batch]),
         "object_desc": [b["object_desc"] for b in batch],
         "sample_id": [b["sample_id"] for b in batch],
     }
+
+    # 透传新增的可选元数据字段
+    for key in ("scene_name", "removed_object", "text_source"):
+        if key in batch[0]:
+            result[key] = [b[key] for b in batch]
+
+    return result
 
 
 if __name__ == "__main__":

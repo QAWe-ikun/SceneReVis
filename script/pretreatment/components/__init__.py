@@ -6,6 +6,7 @@ from .renderer import OrthoRenderer
 from .heatmap_generator import HeatmapGenerator
 from .sample_saver import SampleSaver
 from .text_processor import TextProcessor
+from .vlm_client import VLMClient
 
 __all__ = [
     "SceneBuilder",
@@ -13,4 +14,5 @@ __all__ = [
     "HeatmapGenerator",
     "SampleSaver",
     "TextProcessor",
+    "VLMClient",
 ]

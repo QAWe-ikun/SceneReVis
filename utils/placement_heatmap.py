@@ -5,28 +5,32 @@ Uses SigLIP for all encoding: room spatial features, object reference, and text.
 All features share the same embedding space, making fusion straightforward.
 
 Architecture:
-    Room Image   → SigLIP ViT → Spatial Features (27x27) → SpatialRefinement → Key/Value
-    Object Image → SigLIP ViT → Pooled Global Feature ─┐
-                                                        ├→ ObjTextFusion → Query
-    Text         → SigLIP Text Encoder ────────────────┘
-                                                              ↓
-                                                        CrossAttention → Heatmap
+    Room Image   → SigLIP ViT → Spatial Features (27×27=729 tokens) → SpatialRefinement → Query
+    Object Image → SigLIP ViT → Patch Features (729 tokens) ─┐
+                                                             ├→ 拼接 → 全局自注意力 → Key sequence
+    Text         → SigLIP Text Encoder → Token Features ────┘
+                                                                     ↓
+                                                     CrossAttention → Heatmap
+
+    所有编码保留原始序列维度，不压缩为单向量。
+    物体 729 tokens + 文本 ~64 tokens 拼接为整体序列，全局自注意力后作为 key。
+    房间 729 个空间 query 交叉注意力到 ~793 个 key，输出热力图。
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple
 from PIL import Image
 import torchvision.transforms as T
 
 
 # ============================================================================
-# SigLIP Vision Encoder (shared for room spatial + object global features)
+# SigLIP Vision Encoder (shared for room spatial + object patch features)
 # ============================================================================
 
 class SiglipVisionEncoder(nn.Module):
-    """SigLIP vision encoder for both spatial and global features.
+    """SigLIP vision encoder for both room spatial and object patch features.
 
     Args:
         model_name: HuggingFace model name, e.g. "google/siglip-so400m-patch14-384"
@@ -69,6 +73,7 @@ class SiglipVisionEncoder(nn.Module):
             num_patches = seq_len - 1
             self.drop_cls = True
         self.grid_size = int(round(num_patches ** 0.5))
+        self.num_patches = num_patches
         print(f"[SiglipVisionEncoder] seq_len={seq_len}, grid={self.grid_size}x{self.grid_size}, drop_cls={self.drop_cls}")
 
         self.eval()
@@ -90,19 +95,19 @@ class SiglipVisionEncoder(nn.Module):
         features = patch_tokens.reshape(B, self.grid_size, self.grid_size, self.feature_dim)
         return features
 
-    def encode_global(self, image: torch.Tensor) -> torch.Tensor:
-        """Extract global (pooled) feature from image tensor.
+    def encode_patches(self, image: torch.Tensor) -> torch.Tensor:
+        """Extract patch token sequence from image tensor (不压缩).
 
         Args:
             image: [B, 3, H, W] preprocessed image tensor
 
         Returns:
-            [B, feature_dim] global feature vector
+            [B, num_patches, feature_dim] patch token sequence
         """
-        outputs = self.model(pixel_values=image)
-        # pooler_output is the mean-pooled representation
-        pooled = outputs.pooler_output  # [B, feature_dim]
-        return pooled
+        outputs = self.model(pixel_values=image, output_hidden_states=True)
+        hidden = outputs.last_hidden_state  # [B, seq_len, C]
+        patch_tokens = hidden[:, 1:, :] if self.drop_cls else hidden
+        return patch_tokens  # [B, 729, C]
 
 
 # ============================================================================
@@ -132,14 +137,16 @@ class SiglipTextEncoder(nn.Module):
 
         self.eval()
 
-    def encode(self, text: str) -> torch.Tensor:
-        """Encode text description.
+    def encode(self, text: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode text description, 保留完整 token 序列.
 
         Args:
             text: object description string
 
         Returns:
-            [1, feature_dim] text feature vector
+            tuple:
+                - text_features: [1, T, feature_dim] token-level features
+                - attention_mask: [1, T] bool mask (True = valid token)
         """
         device = next(self.model.parameters()).device
         inputs = self.tokenizer(
@@ -147,15 +154,22 @@ class SiglipTextEncoder(nn.Module):
             padding="max_length",
             truncation=True,
             max_length=64,
-            return_tensors="pt"
+            return_tensors="pt",
+            return_attention_mask=True,
         ).to(device)
 
         with torch.no_grad():
             outputs = self.model(**inputs)
-            # pooler_output is the [CLS] token representation
-            text_features = outputs.pooler_output  # [1, feature_dim]
+            text_features = outputs.last_hidden_state  # [1, T, feature_dim]
 
-        return text_features
+        # Build attention mask: True = valid token
+        if "attention_mask" in inputs:
+            attention_mask = inputs["attention_mask"].bool()  # [1, T]
+        else:
+            # Fallback: non-padding tokens are valid (SigLIP pad_token_id=1)
+            pad_id = self.tokenizer.pad_token_id or 1
+            attention_mask = inputs["input_ids"] != pad_id  # [1, T]
+        return text_features, attention_mask
 
 
 # ============================================================================
@@ -196,7 +210,7 @@ class SpatialRefinement(nn.Module):
         # [B, H, W, D] -> [B, H*W, D]
         x_flat = x.reshape(B, H * W, -1)
 
-        # 全局自注意力 (729 tokens, 完全可行)
+        # 全局自注意力 (729 tokens)
         attn_out, _ = self.self_attn(x_flat, x_flat, x_flat)
 
         # [B, H*W, D] -> [B, H, W, D]
@@ -210,45 +224,81 @@ class SpatialRefinement(nn.Module):
 # ============================================================================
 
 class CrossAttentionHeatmap(nn.Module):
-    """Computes a 2D heatmap via cross-attention between query and spatial features.
+    """多头交叉注意力热力图头
 
-    The fused object+text embedding serves as the query, and each spatial
-    feature vector serves as a key. The resulting attention weights form the heatmap.
+    Room spatial features (729 tokens) 为 Query,
+    物体+文本序列 (~793 tokens) 为 Key/Value.
+    每个空间位置交叉注意力后得到一个标量分数，形成热力图。
+
+    Args:
+        feature_dim: spatial feature dim (siglip_dim, 如 1152)
+        kv_dim: KV sequence dim (ObjTextFusion 输出，如 256)
+        hidden_dim: attention hidden dim
+        num_heads: attention heads
     """
 
-    def __init__(self, feature_dim: int, query_dim: int = None):
+    def __init__(self, feature_dim: int, kv_dim: int,
+                 hidden_dim: int = 256, num_heads: int = 8):
         super().__init__()
-        query_dim = query_dim or feature_dim
-        self.visual_proj = nn.Linear(feature_dim, query_dim)
-        self.text_proj = nn.Linear(query_dim, query_dim)
-        self.temperature = nn.Parameter(torch.tensor(1.0))
-        self.logit_bias = nn.Parameter(torch.tensor(0.0))  # 可学习偏置，提升峰值置信度
 
-    def forward(self, spatial_features: torch.Tensor,
-                text_query: torch.Tensor) -> torch.Tensor:
-        """Compute placement heatmap.
+        # Query 从 siglip_dim 投影到 hidden_dim
+        self.query_proj = nn.Linear(feature_dim, hidden_dim)
+        # KV 已经在 ObjTextFusion 投影到 kv_dim，只需投影到 hidden_dim
+        self.kv_proj = nn.Linear(kv_dim, hidden_dim) if kv_dim != hidden_dim else nn.Identity()
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+
+        # 将注意力输出投影为标量分数
+        self.score_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, 1),
+        )
+
+        self.logit_bias = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        spatial_features: torch.Tensor,
+        kv_features: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """多头交叉注意力 → 热力图
 
         Args:
-            spatial_features: [B, H, W, C_v] from spatial refinement
-            text_query: [B, C_q] fused object+text embedding
+            spatial_features: [B, H, W, C] room spatial features (Query)
+            kv_features: [B, N, C] object+text sequence (Key/Value)
+            key_padding_mask: [B, N] bool, True = 需要屏蔽的 padding token
 
         Returns:
             [B, H, W] heatmap with values in [0, 1]
         """
-        B, H, W, C_v = spatial_features.shape
+        B, H, W, C = spatial_features.shape
 
-        visual_keys = self.visual_proj(spatial_features)
-        text_q = self.text_proj(text_query)
+        # Query: 空间特征 → [B, H*W, D]
+        spatial_q = self.query_proj(spatial_features)
+        spatial_q = spatial_q.reshape(B, H * W, -1)
 
-        visual_keys_flat = visual_keys.reshape(B, H * W, -1)
+        # Key/Value: 物体+文本序列 → [B, N, D]
+        kv = self.kv_proj(kv_features)
 
-        logits = torch.einsum("bd,bnd->bn", text_q, visual_keys_flat)
-        logits = logits / self.temperature.clamp(min=0.01) + self.logit_bias
+        # 交叉注意力: Q=spatial, K=V=kv
+        attn_out, _ = self.cross_attn(
+            query=spatial_q,
+            key=kv,
+            value=kv,
+            key_padding_mask=key_padding_mask,
+        )  # [B, H*W, D]
 
-        # 使用 sigmoid (每个像素独立预测 [0,1])，不用 softmax (互斥概率分布)
-        # sigmoid + weighted BCE 自然驱动: 峰值区域→1.0, 背景→0.0
-        # logit_bias 让模型自己学习将 logit 上移(提高峰值置信度)
-        # 训练时不做 max 归一化——初始均匀输出除以 max 后全变 1.0 会导致梯度崩溃
+        # 投影为标量分数
+        logits = self.score_head(attn_out).squeeze(-1)  # [B, H*W]
+        logits = logits + self.logit_bias
+
+        # sigmoid → [0, 1]
         heatmap_flat = torch.sigmoid(logits)
         heatmap = heatmap_flat.reshape(B, H, W)
 
@@ -256,42 +306,97 @@ class CrossAttentionHeatmap(nn.Module):
 
 
 # ============================================================================
-# Object-Text Fusion Module (SigLIP aligned space)
+# Object-Text Fusion Module (序列拼接 + 全局自注意力)
 # ============================================================================
 
 class ObjTextFusion(nn.Module):
-    """Fuse SigLIP object visual features with SigLIP text embedding.
+    """Fuse object patch tokens with text tokens by sequence concatenation + self-attention.
 
-    Since both are in the same SigLIP embedding space, fusion is simple:
-    concatenate and project.
+    物体图像 729 tokens + 文本 T tokens → 拼接为 (729+T) tokens 的整体序列，
+    通过全局自注意力让所有 token 相互交互，形成统一的上下文表示。
 
     Args:
         siglip_dim: SigLIP feature dimension (e.g. 1152)
-        output_dim: output dimension for query vector
+        output_dim: output dimension per token
+        num_heads: number of attention heads
+        num_layers: number of self-attention layers
     """
 
-    def __init__(self, siglip_dim: int, output_dim: int = None):
+    def __init__(self, siglip_dim: int, output_dim: int = 256,
+                 num_heads: int = 8, num_layers: int = 2):
         super().__init__()
-        output_dim = output_dim or siglip_dim
-        self.fusion = nn.Sequential(
-            nn.Linear(siglip_dim * 2, siglip_dim),
-            nn.GELU(),
-            nn.Linear(siglip_dim, output_dim),
-        )
 
-    def forward(self, obj_features: torch.Tensor,
-                text_features: torch.Tensor) -> torch.Tensor:
-        """Fuse object visual and text features.
+        self.proj = nn.Linear(siglip_dim, output_dim)
+        self.norm = nn.LayerNorm(output_dim)
+
+        # Self-attention layers for cross-modal interaction
+        self.self_attn_layers = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=output_dim,
+                num_heads=num_heads,
+                batch_first=True,
+            )
+            for _ in range(num_layers)
+        ])
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(output_dim)
+            for _ in range(num_layers)
+        ])
+
+        self.num_layers = num_layers
+
+    def forward(
+        self,
+        obj_patches: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fuse object and text token sequences with global self-attention.
 
         Args:
-            obj_features: [B, siglip_dim] SigLIP object visual embedding
-            text_features: [B, siglip_dim] SigLIP text embedding
+            obj_patches: [B, N_obj, siglip_dim] object patch tokens (729)
+            text_tokens: [B, T, siglip_dim] text tokens
+            text_mask: [B, T] bool, True = valid token
 
         Returns:
-            [B, output_dim] fused query vector
+            tuple:
+                - fused: [B, N_obj+T, output_dim] fused sequence after global self-attention
+                - padding_mask: [B, N_obj+T] bool, True = 需要屏蔽的 padding
         """
-        combined = torch.cat([obj_features, text_features], dim=-1)
-        return self.fusion(combined)
+        B = obj_patches.size(0)
+        N_obj = obj_patches.size(1)
+        T_len = text_tokens.size(1)
+
+        # Expand text to match batch size if needed
+        if text_tokens.size(0) == 1 and B > 1:
+            text_tokens = text_tokens.expand(B, -1, -1)
+            text_mask = text_mask.expand(B, -1)
+
+        # Concatenate as a whole sequence: [obj_patches, text_tokens]
+        combined = torch.cat([obj_patches, text_tokens], dim=1)  # [B, N_obj+T, siglip_dim]
+
+        # Project to output_dim
+        fused = self.proj(combined)
+        fused = self.norm(fused)
+
+        # Build padding mask: object tokens are all valid, text uses original mask
+        obj_mask = torch.ones(B, N_obj, dtype=torch.bool, device=obj_patches.device)
+        # key_padding_mask: True = IGNORE (padding)
+        padding_mask = ~torch.cat([obj_mask, text_mask], dim=1)  # [B, N_obj+T]
+
+        # Self-attention layers for global token interaction
+        for i in range(self.num_layers):
+            # Global self-attention with padding mask
+            attn_out, _ = self.self_attn_layers[i](
+                query=fused,
+                key=fused,
+                value=fused,
+                key_padding_mask=padding_mask,
+            )
+            # Residual connection + layer norm
+            fused = self.layer_norms[i](fused + attn_out)
+
+        return fused, padding_mask
 
 
 # ============================================================================
@@ -302,12 +407,14 @@ class PlacementHeatmap(nn.Module):
     """Complete heatmap generation pipeline with pure SigLIP.
 
     Architecture:
-        Room Image   -> SigLIP ViT (spatial) -> SpatialRefinement -> Key/Value
-        Object Image -> SigLIP ViT (global) ─┐
-                                             +-> ObjTextFusion -> Query
-        Text         -> SigLIP Text Encoder ─┘
-                                                   |
-                                             CrossAttention -> Heatmap
+        Room Image   -> SigLIP ViT -> 729 spatial tokens -> SpatialRefinement -> Query
+        Object Image -> SigLIP ViT -> 729 patch tokens ──┐
+                                                         +-> 拼接 -> 全局自注意力 -> KV sequence
+        Text         -> SigLIP Text Encoder -> T tokens ─┘
+                                                                         |
+                                                               CrossAttention -> Heatmap
+
+        所有编码保留原始序列维度。物体+文本作为整体序列全局自注意力。
     """
 
     SIGLIP_MODEL = "google/siglip-so400m-patch14-384"
@@ -318,27 +425,33 @@ class PlacementHeatmap(nn.Module):
 
         siglip_model = siglip_model or self.SIGLIP_MODEL
 
-        # SigLIP vision encoder (shared for room spatial + object global)
+        # SigLIP vision encoder (shared for room spatial + object patches)
         self.vision_encoder = SiglipVisionEncoder(siglip_model)
         siglip_dim = self.vision_encoder.feature_dim
 
         # SigLIP text encoder
         self.text_encoder = SiglipTextEncoder(siglip_model)
 
-        # Object-Text fusion (both already in SigLIP space)
-        self.obj_text_fusion = ObjTextFusion(siglip_dim, siglip_dim)
+        # Hidden dim for attention modules
+        hidden_dim = 256
 
-        # Spatial refinement (windowed self-attention on room features)
+        # Object-Text fusion (sequence concat, 不压缩)
+        self.obj_text_fusion = ObjTextFusion(siglip_dim, output_dim=hidden_dim)
+
+        # Spatial refinement (self-attention on room features)
         self.spatial_refinement = SpatialRefinement(
             in_channels=siglip_dim,
-            hidden_dim=256,
+            hidden_dim=hidden_dim,
             num_heads=8,
         )
 
         # Cross-attention heatmap head
+        # spatial_features 来自 SpatialRefinement (siglip_dim), KV 来自 ObjTextFusion (hidden_dim)
         self.heatmap_head = CrossAttentionHeatmap(
             feature_dim=siglip_dim,
-            query_dim=siglip_dim,
+            kv_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            num_heads=8,
         )
 
     def preprocess_image(self, image_path: str) -> torch.Tensor:
@@ -374,22 +487,22 @@ class PlacementHeatmap(nn.Module):
         # Stage 2: Spatial refinement (self-attention)
         spatial_features = self.spatial_refinement(spatial_features)
 
-        # Stage 3: SigLIP encode object image + text
+        # Stage 3: SigLIP encode object image (patch sequence) + text (token sequence)
         if object_image_path:
             obj_tensor = self.preprocess_image(object_image_path)
-            obj_features = self.vision_encoder.encode_global(obj_tensor)  # [1, C]
+            obj_patches = self.vision_encoder.encode_patches(obj_tensor)  # [1, 729, C]
         else:
-            # If no object image, use zeros
             device = next(self.vision_encoder.model.parameters()).device
-            obj_features = torch.zeros(1, self.vision_encoder.feature_dim, device=device)
+            obj_patches = torch.zeros(1, self.vision_encoder.num_patches,
+                                      self.vision_encoder.feature_dim, device=device)
 
-        text_features = self.text_encoder.encode(object_desc)  # [1, C]
+        text_tokens, text_mask = self.text_encoder.encode(object_desc)  # [1, T, C], [1, T]
 
-        # Stage 4: Object-Text fusion -> query
-        query = self.obj_text_fusion(obj_features, text_features)  # [1, C]
+        # Stage 4: Object-Text fusion -> KV sequence
+        kv_seq, kv_padding_mask = self.obj_text_fusion(obj_patches, text_tokens, text_mask)
 
         # Stage 5: Cross-attention -> heatmap at ViT patch resolution
-        heatmap_low = self.heatmap_head(spatial_features, query)  # [1, g, g]
+        heatmap_low = self.heatmap_head(spatial_features, kv_seq, kv_padding_mask)  # [1, g, g]
 
         # Stage 6: Upsample to target heatmap resolution
         heatmap = F.interpolate(
@@ -399,7 +512,7 @@ class PlacementHeatmap(nn.Module):
             align_corners=False,
         ).squeeze(0).squeeze(0)
 
-        # Normalize to [0, 1]
+        # Normalize to [0, 1] (inference only)
         if heatmap.max() > 0:
             heatmap = heatmap / heatmap.max()
 
@@ -421,31 +534,29 @@ class PlacementHeatmap(nn.Module):
         Returns:
             [B, heatmap_res, heatmap_res] heatmap tensor with values in [0, 1]
         """
+        B = room_image.size(0)
+
         # Stage 1: SigLIP encode room top view -> spatial features
         spatial_features = self.vision_encoder.encode_spatial(room_image)  # [B, g, g, C]
 
         # Stage 2: Spatial refinement (self-attention)
         spatial_features = self.spatial_refinement(spatial_features)
 
-        # Stage 3: SigLIP encode object image + text
+        # Stage 3: SigLIP encode object image (patch sequence) + text (token sequence)
         if object_image is not None:
-            obj_features = self.vision_encoder.encode_global(object_image)  # [B, C]
+            obj_patches = self.vision_encoder.encode_patches(object_image)  # [B, 729, C]
         else:
-            # If no object image, use zeros
             device = next(self.vision_encoder.model.parameters()).device
-            B = room_image.size(0)
-            obj_features = torch.zeros(B, self.vision_encoder.feature_dim, device=device)
+            obj_patches = torch.zeros(B, self.vision_encoder.num_patches,
+                                      self.vision_encoder.feature_dim, device=device)
 
-        text_features = self.text_encoder.encode(object_desc)  # [1, C]
-        # Broadcast text features to match batch size
-        if text_features.size(0) != room_image.size(0):
-            text_features = text_features.expand(room_image.size(0), -1)
+        text_tokens, text_mask = self.text_encoder.encode(object_desc)  # [1, T, C], [1, T]
 
-        # Stage 4: Object-Text fusion -> query
-        query = self.obj_text_fusion(obj_features, text_features)  # [B, C]
+        # Stage 4: Object-Text fusion -> KV sequence
+        kv_seq, kv_padding_mask = self.obj_text_fusion(obj_patches, text_tokens, text_mask)
 
         # Stage 5: Cross-attention -> heatmap at ViT patch resolution
-        heatmap_low = self.heatmap_head(spatial_features, query)  # [B, g, g]
+        heatmap_low = self.heatmap_head(spatial_features, kv_seq, kv_padding_mask)  # [B, g, g]
 
         # Stage 6: Upsample to target heatmap resolution
         heatmap = F.interpolate(
