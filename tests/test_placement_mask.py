@@ -121,6 +121,12 @@ def test_grid_world_roundtrip():
     ortho_scale = 6.0
     res = 64
 
+    # Match rendered top-view convention: top image row corresponds to max Z.
+    _, z_top = grid_to_world(0, 0, cx, cz, ortho_scale, res)
+    _, z_bottom = grid_to_world(res - 1, 0, cx, cz, ortho_scale, res)
+    assert z_top > cz, f"row=0 should map to max Z side, got {z_top}"
+    assert z_bottom < cz, f"last row should map to min Z side, got {z_bottom}"
+
     # Test several positions
     for gi, gj in [(0, 0), (32, 32), (63, 63), (10, 50)]:
         x, z = grid_to_world(gi, gj, cx, cz, ortho_scale, res)

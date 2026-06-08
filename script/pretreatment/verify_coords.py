@@ -9,24 +9,24 @@ import numpy as np
 def renderer_pixel_mapping(world_x, world_z, cx, cz, ortho_scale, image_size):
     """Actual pixel mapping from camera pose (world X -> col, world Z -> row)"""
     col = ((world_x - cx) / ortho_scale + 0.5) * image_size
-    row = ((world_z - cz) / ortho_scale + 0.5) * image_size  # row 0 = min Z
+    row = ((cz - world_z) / ortho_scale + 0.5) * image_size  # row 0 = max Z
     return row, col
 
 # ---- From heatmap_generator.py ----
 def heatmap_world_to_pixel(world_x, world_z, cx, cz, ortho_scale, image_size):
     pixel_col = ((world_x - cx) / ortho_scale + 0.5) * image_size
-    pixel_row = ((world_z - cz) / ortho_scale + 0.5) * image_size  # row 0 = min Z
+    pixel_row = ((cz - world_z) / ortho_scale + 0.5) * image_size  # row 0 = max Z
     return pixel_row, pixel_col
 
 # ---- From placement_mask.py ----
 def mask_grid_to_world(gi, gj, cx, cz, ortho_scale, heatmap_res):
     x = cx + ((gj + 0.5) / heatmap_res - 0.5) * ortho_scale
-    z = cz + ((gi + 0.5) / heatmap_res - 0.5) * ortho_scale  # gi 0 = min Z
+    z = cz - ((gi + 0.5) / heatmap_res - 0.5) * ortho_scale  # gi 0 = max Z
     return x, z
 
 def mask_world_to_grid(x, z, cx, cz, ortho_scale, heatmap_res):
     gj_cont = (x - cx) / ortho_scale * heatmap_res + heatmap_res / 2 - 0.5
-    gi_cont = (z - cz) / ortho_scale * heatmap_res + heatmap_res / 2 - 0.5  # z -> gi
+    gi_cont = (cz - z) / ortho_scale * heatmap_res + heatmap_res / 2 - 0.5  # z -> gi
     return int(round(gi_cont)), int(round(gj_cont))
 
 
@@ -63,7 +63,7 @@ for tx, tz in [(1.5, 2.0), (-2.0, -1.0), (0.0, 0.0), (3.0, 4.0), (-3.0, -2.0)]:
     check(f"({tx:+.1f},{tz:+.1f}) r=({r_row:.1f},{r_col:.1f}) h=({h_row:.1f},{h_col:.1f})", match)
 
 print("\n" + "=" * 60)
-print("TEST 2: Image convention: row 0=min_Z (top), col 0=min_X (left)")
+print("TEST 2: Image convention: row 0=max_Z (top), col 0=min_X (left)")
 print("=" * 60)
 
 x_max = cx + ortho_scale / 2
@@ -75,8 +75,8 @@ cell = ortho_scale / heatmap_res
 x_r0c0, z_r0c0 = mask_grid_to_world(0, 0, cx, cz, ortho_scale, heatmap_res)
 x_rNcN, z_rNcN = mask_grid_to_world(heatmap_res-1, heatmap_res-1, cx, cz, ortho_scale, heatmap_res)
 
-check(f"row=0 -> z={z_r0c0:.4f} (expect ~{z_min+cell/2:.4f})", z_r0c0 < cz)
-check(f"row=N -> z={z_rNcN:.4f} (expect ~{z_max-cell/2:.4f})", z_rNcN > cz)
+check(f"row=0 -> z={z_r0c0:.4f} (expect ~{z_max-cell/2:.4f})", z_r0c0 > cz)
+check(f"row=N -> z={z_rNcN:.4f} (expect ~{z_min+cell/2:.4f})", z_rNcN < cz)
 check(f"col=0 -> x={x_r0c0:.4f} (expect ~{x_min+cell/2:.4f})", x_r0c0 < cx)
 check(f"col=N -> x={x_rNcN:.4f} (expect ~{x_max-cell/2:.4f})", x_rNcN > cx)
 
@@ -116,7 +116,7 @@ def gen_heatmap(tx, tz, bounds_bottom, image_size, sigma=15.0):
     span_ = max(xs.max() - xs.min(), zs.max() - zs.min(), 1.0)
     os_ = span_ * 1.2
     peak_col = ((tx - cx_) / os_ + 0.5) * image_size
-    peak_row = ((tz - cz_) / os_ + 0.5) * image_size  # row 0 = min Z
+    peak_row = ((cz_ - tz) / os_ + 0.5) * image_size  # row 0 = max Z
     rc, cc = np.ogrid[:image_size, :image_size]
     hm = np.exp(-((rc - peak_row)**2 + (cc - peak_col)**2) / (2 * sigma**2))
     return hm / hm.max()

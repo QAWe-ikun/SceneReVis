@@ -6,7 +6,7 @@ the grid cell is a valid placement location for a new object.
 
 Image pixel convention (matches rendered top-down view):
     mask[row, col] where:
-      row (first axis) → world Z, row=0 → z_min (top of image)
+      row (first axis) -> world Z, row=0 -> z_max (top of image)
       col (second axis) → world X, col=0 → x_min (left of image)
 """
 
@@ -68,7 +68,7 @@ def _room_mask(bounds_bottom: List[List[float]], heatmap_res: int,
     margin_x = cell_size_x / 2
     margin_z = cell_size_z / 2
 
-    zs_row = np.linspace(z_min + margin_z, z_max - margin_z, heatmap_res)  # row 0 = min Z
+    zs_row = np.linspace(z_max - margin_z, z_min + margin_z, heatmap_res)  # row 0 = max Z
     xs_col = np.linspace(x_min + margin_x, x_max - margin_x, heatmap_res)  # col 0 = min X
     gx, gz = np.meshgrid(xs_col, zs_row, indexing='xy')
     points = np.stack([gx.ravel(), gz.ravel()], axis=-1)
@@ -198,7 +198,7 @@ def _collision_mask(objects: List[Dict[str, Any]], heatmap_res: int,
     margin_x = cell_size_x / 2
     margin_z = cell_size_z / 2
 
-    zs_row = np.linspace(z_min + margin_z, z_max - margin_z, heatmap_res)
+    zs_row = np.linspace(z_max - margin_z, z_min + margin_z, heatmap_res)
     xs_col = np.linspace(x_min + margin_x, x_max - margin_x, heatmap_res)
     gx, gz = np.meshgrid(xs_col, zs_row, indexing='xy')
     points = np.stack([gx.ravel(), gz.ravel()], axis=-1)
@@ -287,7 +287,7 @@ def _target_surface_mask(target_obj: Dict[str, Any], heatmap_res: int,
     cell_size_z = (z_max - z_min) / heatmap_res
     margin_x = cell_size_x / 2
     margin_z = cell_size_z / 2
-    zs_row = np.linspace(z_min + margin_z, z_max - margin_z, heatmap_res)
+    zs_row = np.linspace(z_max - margin_z, z_min + margin_z, heatmap_res)
     xs_col = np.linspace(x_min + margin_x, x_max - margin_x, heatmap_res)
     gx, gz = np.meshgrid(xs_col, zs_row, indexing='xy')
     points = np.stack([gx.ravel(), gz.ravel()], axis=-1)
@@ -311,7 +311,7 @@ def grid_to_world(gi: int, gj: int, cx: float, cz: float,
       gj (second index / col) → X, gj=0 → x_min
     """
     x = cx + ((gj + 0.5) / heatmap_res - 0.5) * ortho_scale
-    z = cz + ((gi + 0.5) / heatmap_res - 0.5) * ortho_scale
+    z = cz - ((gi + 0.5) / heatmap_res - 0.5) * ortho_scale
     return x, z
 
 
@@ -326,11 +326,11 @@ def world_to_grid(x: float, z: float, cx: float, cz: float,
     Derivation from grid_to_world:
       x = cx + ((gj + 0.5) / R - 0.5) * S
       => gj = (x - cx) / S * R + R/2 - 0.5
-      z = cz + ((gi + 0.5) / R - 0.5) * S
-      => gi = (z - cz) / S * R + R/2 - 0.5
+      z = cz - ((gi + 0.5) / R - 0.5) * S
+      => gi = (cz - z) / S * R + R/2 - 0.5
     """
     gj_continuous = (x - cx) / ortho_scale * heatmap_res + heatmap_res / 2 - 0.5
-    gi_continuous = (z - cz) / ortho_scale * heatmap_res + heatmap_res / 2 - 0.5
+    gi_continuous = (cz - z) / ortho_scale * heatmap_res + heatmap_res / 2 - 0.5
     gi = int(round(gi_continuous))
     gj = int(round(gj_continuous))
     gi = np.clip(gi, 0, heatmap_res - 1)
@@ -511,7 +511,7 @@ def visualize_mask(mask: np.ndarray, ortho_scale: float,
     ax.set_xticks([0, mask.shape[1] - 1])
     ax.set_xticklabels([f'{x_min_world:.1f}', f'{x_max_world:.1f}'])
     ax.set_yticks([0, mask.shape[0] - 1])
-    ax.set_yticklabels([f'{z_min_world:.1f}', f'{z_max_world:.1f}'])
+    ax.set_yticklabels([f'{z_max_world:.1f}', f'{z_min_world:.1f}'])
 
     feasible_pct = mask.sum() / (mask.shape[0] * mask.shape[1]) * 100
     ax.text(0.02, 0.98, f'Feasible: {feasible_pct:.1f}%',

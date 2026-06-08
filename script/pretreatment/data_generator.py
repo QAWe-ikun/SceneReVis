@@ -18,6 +18,7 @@ import random
 import logging
 import warnings
 import numpy as np
+from scipy import ndimage
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -133,18 +134,59 @@ class HeatmapDataGenerator:
                 self.use_vlm = False
 
         # 随机种子
-        seed = gen_config.get("seed", 42)
-        random.seed(seed)
-        np.random.seed(seed)
+        self.seed = gen_config.get("seed", 42)
+        self.append_metadata = gen_config.get("append_metadata", False)
+        random.seed(self.seed)
+        np.random.seed(self.seed)
 
     @staticmethod
     def _remove_object_from_scene(scene, obj):
         """从场景副本中删除指定物体"""
         new_scene = scene.copy()
-        geom_name = f"obj_{obj.jid}"
+        geom_name = getattr(obj, "geom_name", f"obj_{obj.jid}")
         if geom_name in new_scene.geometry:
             del new_scene.geometry[geom_name]
         return new_scene
+
+    @staticmethod
+    def _removed_object_pixel_center(original_image, plane_image):
+        """Estimate removed object center from rendered image difference."""
+        if original_image is None or plane_image is None:
+            return None
+        if original_image.shape != plane_image.shape:
+            return None
+
+        diff = np.abs(
+            original_image.astype(np.int16) - plane_image.astype(np.int16)
+        ).sum(axis=2)
+        if diff.max() <= 0:
+            return None
+
+        threshold = max(30.0, float(np.percentile(diff, 99) * 0.35))
+        labels, count = ndimage.label(diff > threshold)
+        if count == 0:
+            return None
+
+        best_score = 0.0
+        best_center = None
+        for label_idx in range(1, count + 1):
+            ys, xs = np.nonzero(labels == label_idx)
+            area = len(xs)
+            if area < 50:
+                continue
+            weights = diff[ys, xs].astype(np.float64)
+            weight_sum = weights.sum()
+            if weight_sum <= 0:
+                continue
+            score = area * float(weights.mean())
+            if score <= best_score:
+                continue
+            best_score = score
+            peak_row = float((ys * weights).sum() / weight_sum)
+            peak_col = float((xs * weights).sum() / weight_sum)
+            best_center = (peak_row, peak_col)
+
+        return best_center
 
     def _get_splits(self, n: int) -> List[str]:
         """根据比例生成划分列表"""
@@ -190,8 +232,27 @@ class HeatmapDataGenerator:
             if len(results) >= self.max_object_nums:
                 break
 
-            # 生成 GT 热力图
-            if self.adaptive_sigma:
+            # 从场景中删除目标物体
+            scene_without_obj = self._remove_object_from_scene(scene, target_obj)
+
+            # 渲染剔除后的房间俯视图
+            plane_image = self.renderer.render_top_view(scene_without_obj, bounds_bottom)
+            if plane_image is None:
+                continue
+
+            gt_pixel_center = self._removed_object_pixel_center(original_image, plane_image)
+            gt_center_source = "render_diff" if gt_pixel_center is not None else "world_pos"
+            sigma_pixels = (
+                self.heatmap_generator.object_sigma_pixels(target_obj.size, bounds_bottom)
+                if self.adaptive_sigma
+                else self.heatmap_generator.sigma
+            )
+            if gt_pixel_center is not None:
+                peak_row, peak_col = gt_pixel_center
+                heatmap = self.heatmap_generator.generate_from_pixel(
+                    peak_row, peak_col, sigma=sigma_pixels
+                )
+            elif self.adaptive_sigma:
                 heatmap = self.heatmap_generator.generate_with_object_sigma(
                     target_obj.pos, target_obj.size, bounds_bottom
                 )
@@ -201,14 +262,6 @@ class HeatmapDataGenerator:
                 )
 
             if heatmap is None or heatmap.max() == 0:
-                continue
-
-            # 从场景中删除目标物体
-            scene_without_obj = self._remove_object_from_scene(scene, target_obj)
-
-            # 渲染剔除后的房间俯视图
-            plane_image = self.renderer.render_top_view(scene_without_obj, bounds_bottom)
-            if plane_image is None:
                 continue
 
             # 渲染物体参考图
@@ -225,18 +278,24 @@ class HeatmapDataGenerator:
 
             # 被移除物体的 3D 元数据
             removed_object = {
+                "instance_id": target_obj.instance_id,
+                "geom_name": target_obj.geom_name,
                 "jid": target_obj.jid,
                 "model_id": target_obj.model_id,
                 "desc": target_obj.desc,
                 "pos": target_obj.pos,
                 "rot": target_obj.rot,
                 "size": target_obj.size,
+                "gt_center_source": gt_center_source,
             }
+            if gt_pixel_center is not None:
+                peak_row, peak_col = gt_pixel_center
+                removed_object["gt_pixel_center"] = [float(peak_col), float(peak_row)]
 
             results.append({
                 "scene_name": scene_name,
                 "split": split,
-                "obj_id": target_obj.jid,
+                "obj_id": f"{target_obj.instance_id:04d}_{target_obj.jid}",
                 "plane_image": plane_image,
                 "heatmap": heatmap,
                 "object_image": object_image,
@@ -271,6 +330,8 @@ class HeatmapDataGenerator:
         if not json_files:
             logger.error(f"在 {self.scene_dir} 中未找到 JSON 文件")
             return
+
+        random.Random(self.seed).shuffle(json_files)
 
         n = len(json_files)
         splits = self._get_splits(n)
@@ -307,7 +368,7 @@ class HeatmapDataGenerator:
 
         # 保存元数据 JSON
         for split_name in ["train", "val", "test"]:
-            self.sample_saver.save_split_json(split_name)
+            self.sample_saver.save_split_json(split_name, append=self.append_metadata)
 
         logger.info("=" * 60)
         logger.info(f"Phase 1 完成! 共生成 {self.sample_saver.sample_counter} 个训练样本")
@@ -348,7 +409,8 @@ class HeatmapDataGenerator:
         tp_count = 0
         total_updated = 0
 
-        for split_name in ["train", "val", "test"]:
+        # for split_name in ["train", "val", "test"]:
+        for split_name in ["val", "test"]:
             json_path = self.output_dir / split_name / f"{split_name}.json"
             if not json_path.exists():
                 logger.warning(f"跳过 {split_name}: {json_path} 不存在")

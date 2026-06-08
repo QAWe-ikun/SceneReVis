@@ -108,7 +108,7 @@ class SceneBuilder:
 
         # 加载所有家具
         objects = []
-        for obj_data in self.extract_objects(scene_data):
+        for obj_idx, obj_data in enumerate(self.extract_objects(scene_data)):
             desc = obj_data.get('desc', '')
             jid = obj_data.get('jid', '')
             pos = obj_data.get('pos', [0, 0, 0])
@@ -142,9 +142,12 @@ class SceneBuilder:
             T[:3, 3] = pos
             mesh_transformed.apply_transform(T)
 
-            scene.add_geometry(mesh_transformed, geom_name=f"obj_{jid}")
+            geom_name = f"obj_{obj_idx:04d}_{jid}"
+            scene.add_geometry(mesh_transformed, geom_name=geom_name)
 
             objects.append(ObjectInfo(
+                instance_id=obj_idx,
+                geom_name=geom_name,
                 jid=jid,
                 model_id=model_id,
                 desc=desc,

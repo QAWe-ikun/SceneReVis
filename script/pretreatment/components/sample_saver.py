@@ -112,8 +112,8 @@ class SampleSaver:
 
         self.samples_by_split[split].append(metadata)
 
-    def save_split_json(self, split_name: str) -> int:
-        """保存 {split}.json 元数据文件 (追加模式)"""
+    def save_split_json(self, split_name: str, append: bool = False) -> int:
+        """保存 {split}.json 元数据文件。默认覆盖，避免重新生成时混入旧样本。"""
         split_samples = self.samples_by_split[split_name]
         if not split_samples:
             return 0
@@ -121,7 +121,7 @@ class SampleSaver:
         split_dir = self.output_dir / split_name
         output_path = split_dir / f"{split_name}.json"
 
-        if output_path.exists():
+        if append and output_path.exists():
             with open(output_path, 'r', encoding='utf-8') as f:
                 existing = json.load(f)
             existing.extend(split_samples)

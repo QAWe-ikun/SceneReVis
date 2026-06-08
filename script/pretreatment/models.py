@@ -9,6 +9,8 @@ from dataclasses import dataclass
 @dataclass
 class ObjectInfo:
     """物体信息"""
+    instance_id: int
+    geom_name: str
     jid: str
     model_id: str
     desc: str

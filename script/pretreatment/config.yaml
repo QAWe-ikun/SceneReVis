@@ -24,6 +24,8 @@ generation:
   adaptive_sigma: false
   # 随机种子
   seed: 42
+  # Phase 1 保存 split JSON 时是否追加旧数据；重新生成训练集时应保持 false
+  append_metadata: false
   # 文本增强配置
   text:
     use_summary: true          # 使用 model_info_3dfuture_assets.json 中的 summary
