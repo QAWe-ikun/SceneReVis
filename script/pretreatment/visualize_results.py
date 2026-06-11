@@ -29,7 +29,7 @@ import torchvision.transforms as T
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from utils.placement_heatmap import PlacementHeatmap
+from utils.placement_heatmap import PlacementHeatmap, load_trainable_heatmap_state_dict
 
 
 CJK_FONT_NAMES = [
@@ -138,7 +138,16 @@ HAS_CJK_FONT = configure_matplotlib_fonts()
 def load_checkpoint(model, checkpoint_path, device):
     """Load checkpoint"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    missing_keys, unexpected_keys = load_trainable_heatmap_state_dict(
+        model,
+        checkpoint["model_state_dict"],
+    )
+    if missing_keys or unexpected_keys:
+        logging.warning(
+            "Checkpoint loaded with missing_keys=%s, unexpected_keys=%s",
+            missing_keys,
+            unexpected_keys,
+        )
     epoch = checkpoint["epoch"]
     best_val_loss = checkpoint.get("best_val_loss", float('inf'))
     logging.info(f"Loaded checkpoint: epoch={epoch}, best_val_loss={best_val_loss:.4f}")
@@ -247,11 +256,10 @@ class Qwen3VLCoordinateBaseline:
             "### Available Tools\n\n"
             "**add_object**: Add a new furniture piece. This visualization baseline extends the SceneReVis "
             "tool arguments with `position_2d_pixel` so the result can be compared with heatmap peaks.\n"
-            "* `object_description` (string): target object description.\n"
             "* `position_2d_pixel` (array): [x, y] pixel coordinate in Image 1 for the object center.\n"
             "* `placement_plane` (string): use \"floor\" unless the object should be placed on top of another object.\n\n"
             "### Current User Request\n\n"
-            f"Please add this target object back into the room: {desc}\n\n"
+            f"{desc}\n\n"
             "### Output Format Requirements\n\n"
             "You must follow the SceneReVis editing format exactly: first `<think>`, then `<tool_calls>`.\n"
             "Return exactly one `add_object` call. Do not use markdown fences.\n\n"
@@ -264,7 +272,6 @@ class Qwen3VLCoordinateBaseline:
             "    \"id\": \"tool_1\",\n"
             "    \"name\": \"add_object\",\n"
             "    \"arguments\": {\n"
-            f"      \"object_description\": {json.dumps(desc, ensure_ascii=False)},\n"
             "      \"position_2d_pixel\": [x, y],\n"
             "      \"placement_plane\": \"floor\"\n"
             "    }\n"

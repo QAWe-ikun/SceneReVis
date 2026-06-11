@@ -18,7 +18,6 @@ import random
 import logging
 import warnings
 import numpy as np
-from scipy import ndimage
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -148,46 +147,6 @@ class HeatmapDataGenerator:
             del new_scene.geometry[geom_name]
         return new_scene
 
-    @staticmethod
-    def _removed_object_pixel_center(original_image, plane_image):
-        """Estimate removed object center from rendered image difference."""
-        if original_image is None or plane_image is None:
-            return None
-        if original_image.shape != plane_image.shape:
-            return None
-
-        diff = np.abs(
-            original_image.astype(np.int16) - plane_image.astype(np.int16)
-        ).sum(axis=2)
-        if diff.max() <= 0:
-            return None
-
-        threshold = max(30.0, float(np.percentile(diff, 99) * 0.35))
-        labels, count = ndimage.label(diff > threshold)
-        if count == 0:
-            return None
-
-        best_score = 0.0
-        best_center = None
-        for label_idx in range(1, count + 1):
-            ys, xs = np.nonzero(labels == label_idx)
-            area = len(xs)
-            if area < 50:
-                continue
-            weights = diff[ys, xs].astype(np.float64)
-            weight_sum = weights.sum()
-            if weight_sum <= 0:
-                continue
-            score = area * float(weights.mean())
-            if score <= best_score:
-                continue
-            best_score = score
-            peak_row = float((ys * weights).sum() / weight_sum)
-            peak_col = float((xs * weights).sum() / weight_sum)
-            best_center = (peak_row, peak_col)
-
-        return best_center
-
     def _get_splits(self, n: int) -> List[str]:
         """根据比例生成划分列表"""
         n_train = int(n * self.train_ratio)
@@ -240,26 +199,23 @@ class HeatmapDataGenerator:
             if plane_image is None:
                 continue
 
-            gt_pixel_center = self._removed_object_pixel_center(original_image, plane_image)
-            gt_center_source = "render_diff" if gt_pixel_center is not None else "world_pos"
+            cx, cz, ortho_scale = self.heatmap_generator.compute_room_params(bounds_bottom)
+            peak_row, peak_col = self.heatmap_generator.world_to_pixel(
+                target_obj.pos[0],
+                target_obj.pos[2],
+                cx,
+                cz,
+                ortho_scale,
+            )
+            gt_center_source = "world_pos_projection"
             sigma_pixels = (
                 self.heatmap_generator.object_sigma_pixels(target_obj.size, bounds_bottom)
                 if self.adaptive_sigma
                 else self.heatmap_generator.sigma
             )
-            if gt_pixel_center is not None:
-                peak_row, peak_col = gt_pixel_center
-                heatmap = self.heatmap_generator.generate_from_pixel(
-                    peak_row, peak_col, sigma=sigma_pixels
-                )
-            elif self.adaptive_sigma:
-                heatmap = self.heatmap_generator.generate_with_object_sigma(
-                    target_obj.pos, target_obj.size, bounds_bottom
-                )
-            else:
-                heatmap = self.heatmap_generator.generate(
-                    target_obj.pos, bounds_bottom
-                )
+            heatmap = self.heatmap_generator.generate_from_pixel(
+                peak_row, peak_col, sigma=sigma_pixels
+            )
 
             if heatmap is None or heatmap.max() == 0:
                 continue
@@ -287,10 +243,8 @@ class HeatmapDataGenerator:
                 "rot": target_obj.rot,
                 "size": target_obj.size,
                 "gt_center_source": gt_center_source,
+                "gt_pixel_center": [float(peak_col), float(peak_row)],
             }
-            if gt_pixel_center is not None:
-                peak_row, peak_col = gt_pixel_center
-                removed_object["gt_pixel_center"] = [float(peak_col), float(peak_row)]
 
             results.append({
                 "scene_name": scene_name,

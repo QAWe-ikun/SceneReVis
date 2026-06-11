@@ -17,12 +17,50 @@ Architecture:
     房间 729 个空间 query 交叉注意力到 ~793 个 key，输出热力图。
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
-from PIL import Image
 import torchvision.transforms as T
+
+
+FROZEN_ENCODER_STATE_PREFIXES = (
+    "vision_encoder.model.",
+    "text_encoder.model.",
+)
+
+
+def is_frozen_encoder_state_key(key: str) -> bool:
+    """Return True for frozen SigLIP weights that should not live in checkpoints."""
+    return key.startswith(FROZEN_ENCODER_STATE_PREFIXES)
+
+
+def trainable_heatmap_state_dict(model: nn.Module) -> dict:
+    """State dict excluding frozen SigLIP encoder weights."""
+    return {
+        key: value
+        for key, value in model.state_dict().items()
+        if not is_frozen_encoder_state_key(key)
+    }
+
+
+def load_trainable_heatmap_state_dict(model: nn.Module, state_dict: dict):
+    """Load trainable/head weights from a trainable-only checkpoint."""
+    frozen_keys = [key for key in state_dict if is_frozen_encoder_state_key(key)]
+    if frozen_keys:
+        raise ValueError(
+            "Trainable-only checkpoint unexpectedly contains frozen SigLIP keys, "
+            f"for example: {frozen_keys[:3]}"
+        )
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing_keys = [
+        key for key in incompatible.missing_keys
+        if not is_frozen_encoder_state_key(key)
+    ]
+    return missing_keys, incompatible.unexpected_keys
 
 
 # ============================================================================
@@ -87,7 +125,8 @@ class SiglipVisionEncoder(nn.Module):
         Returns:
             [B, grid_size, grid_size, feature_dim] spatial feature map
         """
-        outputs = self.model(pixel_values=image, output_hidden_states=True)
+        with torch.no_grad():
+            outputs = self.model(pixel_values=image, output_hidden_states=True)
         hidden = outputs.last_hidden_state  # [B, seq_len, C]
         patch_tokens = hidden[:, 1:, :] if self.drop_cls else hidden
 
@@ -104,7 +143,8 @@ class SiglipVisionEncoder(nn.Module):
         Returns:
             [B, num_patches, feature_dim] patch token sequence
         """
-        outputs = self.model(pixel_values=image, output_hidden_states=True)
+        with torch.no_grad():
+            outputs = self.model(pixel_values=image, output_hidden_states=True)
         hidden = outputs.last_hidden_state  # [B, seq_len, C]
         patch_tokens = hidden[:, 1:, :] if self.drop_cls else hidden
         return patch_tokens  # [B, 729, C]
@@ -365,7 +405,6 @@ class ObjTextFusion(nn.Module):
         """
         B = obj_patches.size(0)
         N_obj = obj_patches.size(1)
-        T_len = text_tokens.size(1)
 
         # Expand text to match batch size if needed
         if text_tokens.size(0) == 1 and B > 1:
@@ -423,7 +462,7 @@ class PlacementHeatmap(nn.Module):
         super().__init__()
         self.heatmap_res = heatmap_res
 
-        siglip_model = siglip_model or self.SIGLIP_MODEL
+        siglip_model = siglip_model or os.environ.get("SCENEREVIS_SIGLIP_MODEL") or self.SIGLIP_MODEL
 
         # SigLIP vision encoder (shared for room spatial + object patches)
         self.vision_encoder = SiglipVisionEncoder(siglip_model)
@@ -454,70 +493,6 @@ class PlacementHeatmap(nn.Module):
             num_heads=8,
         )
 
-    def preprocess_image(self, image_path: str) -> torch.Tensor:
-        """Load and preprocess image for SigLIP.
-
-        Args:
-            image_path: path to image PNG
-
-        Returns:
-            [1, 3, H, W] preprocessed tensor
-        """
-        device = next(self.vision_encoder.model.parameters()).device
-        image = Image.open(image_path).convert("RGB")
-        preprocessed = self.vision_encoder.preprocess(image).unsqueeze(0).to(device)
-        return preprocessed
-
-    def forward(self, room_image_path: str, object_desc: str,
-                object_image_path: Optional[str] = None) -> torch.Tensor:
-        """Generate placement heatmap for an object in a room.
-
-        Args:
-            room_image_path: path to the room top-view PNG (without target object)
-            object_desc: text description of the object to place
-            object_image_path: path to the object reference PNG
-
-        Returns:
-            [H, W] heatmap tensor with values in [0, 1], upscaled to heatmap_res
-        """
-        # Stage 1: SigLIP encode room top view -> spatial features
-        room_tensor = self.preprocess_image(room_image_path)
-        spatial_features = self.vision_encoder.encode_spatial(room_tensor)  # [1, g, g, C]
-
-        # Stage 2: Spatial refinement (self-attention)
-        spatial_features = self.spatial_refinement(spatial_features)
-
-        # Stage 3: SigLIP encode object image (patch sequence) + text (token sequence)
-        if object_image_path:
-            obj_tensor = self.preprocess_image(object_image_path)
-            obj_patches = self.vision_encoder.encode_patches(obj_tensor)  # [1, 729, C]
-        else:
-            device = next(self.vision_encoder.model.parameters()).device
-            obj_patches = torch.zeros(1, self.vision_encoder.num_patches,
-                                      self.vision_encoder.feature_dim, device=device)
-
-        text_tokens, text_mask = self.text_encoder.encode(object_desc)  # [1, T, C], [1, T]
-
-        # Stage 4: Object-Text fusion -> KV sequence
-        kv_seq, kv_padding_mask = self.obj_text_fusion(obj_patches, text_tokens, text_mask)
-
-        # Stage 5: Cross-attention -> heatmap at ViT patch resolution
-        heatmap_low = self.heatmap_head(spatial_features, kv_seq, kv_padding_mask)  # [1, g, g]
-
-        # Stage 6: Upsample to target heatmap resolution
-        heatmap = F.interpolate(
-            heatmap_low.unsqueeze(0),
-            size=(self.heatmap_res, self.heatmap_res),
-            mode='bilinear',
-            align_corners=False,
-        ).squeeze(0).squeeze(0)
-
-        # Normalize to [0, 1] (inference only)
-        if heatmap.max() > 0:
-            heatmap = heatmap / heatmap.max()
-
-        return heatmap
-
     def forward_tensor(
         self,
         room_image: torch.Tensor,
@@ -534,6 +509,15 @@ class PlacementHeatmap(nn.Module):
         Returns:
             [B, heatmap_res, heatmap_res] heatmap tensor with values in [0, 1]
         """
+        return self.forward(room_image, object_desc, object_image)
+
+    def forward(
+        self,
+        room_image: torch.Tensor,
+        object_desc: str,
+        object_image: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Generate placement heatmap from preprocessed tensor inputs."""
         B = room_image.size(0)
 
         # Stage 1: SigLIP encode room top view -> spatial features
@@ -568,207 +552,3 @@ class PlacementHeatmap(nn.Module):
 
         return heatmap
 
-
-# ============================================================================
-# Unified inference interface (combines heatmap + mask)
-# ============================================================================
-
-class PlacementEngine:
-    """High-level placement engine that combines heatmap and feasibility mask.
-
-    Usage:
-        engine = PlacementEngine(heatmap_model=model)
-        position = engine.place_object(
-            scene=scene_json,
-            top_view_path="path/to/top_view.png",
-            object_image_path="path/to/object_ref.png",
-            object_desc="bed",
-            size=[1.8, 0.8, 2.1],
-            rotation=[0, 0, 0, 1],
-            placement_plane="floor",
-        )
-    """
-
-    def __init__(self, heatmap_res: int = 256,
-                 heatmap_model: Optional[PlacementHeatmap] = None,
-                 enable_heatmap: bool = True):
-        self.heatmap_res = heatmap_res
-        self.enable_heatmap = enable_heatmap
-        self.heatmap_model = heatmap_model
-
-    def compute_heatmap(self, room_image_path: str, object_desc: str,
-                        object_image_path: str) -> torch.Tensor:
-        """Compute the learning-based heatmap for a given object.
-
-        Args:
-            room_image_path: path to the room top-view PNG
-            object_desc: text description of the object
-            object_image_path: path to the object reference PNG
-
-        Returns:
-            [heatmap_res, heatmap_res] heatmap tensor with values in [0, 1].
-        """
-        if not self.enable_heatmap or self.heatmap_model is None:
-            return torch.ones(self.heatmap_res, self.heatmap_res)
-
-        self.heatmap_model.eval()
-        with torch.no_grad():
-            heatmap = self.heatmap_model(room_image_path, object_desc, object_image_path)
-        return heatmap
-
-    def place_object(self, scene: dict, top_view_path: str,
-                     object_desc: str, size: list,
-                     rotation: list = None,
-                     placement_plane: str = "floor",
-                     clearance: float = 0.5,
-                     object_image_path: Optional[str] = None) -> Optional[list]:
-        """Compute the optimal placement position for an object.
-
-        Args:
-            scene: scene JSON data
-            top_view_path: path to room top-view PNG
-            object_desc: text description of the object
-            size: [width, height, depth]
-            rotation: [x, y, z, w] quaternion
-            placement_plane: "floor" or target object jid
-            clearance: minimum clearance around existing objects
-            object_image_path: path to object reference PNG (optional)
-
-        Returns:
-            [x, y, z] placement position, or None if no feasible position found.
-        """
-        from utils.placement_mask import compute_mask, find_best_position
-
-        mask, ortho_scale, cx, cz = compute_mask(
-            scene, self.heatmap_res, clearance, placement_plane
-        )
-
-        if not torch.any(mask):
-            print(f"[placement] No feasible position for '{object_desc}'")
-            return None
-
-        if object_image_path is not None:
-            heatmap = self.compute_heatmap(top_view_path, object_desc, object_image_path)
-        else:
-            heatmap = torch.ones(self.heatmap_res, self.heatmap_res)
-
-        score = heatmap * mask.float()
-
-        if not torch.any(score > 0):
-            score = mask.float()
-
-        positions = find_best_position_from_score(
-            score, ortho_scale, cx, cz, self.heatmap_res,
-            placement_plane, scene, top_k=1
-        )
-
-        if not positions:
-            print(f"[placement] Failed to find position for '{object_desc}'")
-            return None
-
-        print(f"[placement] Optimal position for '{object_desc}': {positions[0]}")
-        return positions[0]
-
-
-def find_best_position_from_score(score: torch.Tensor, ortho_scale: float,
-                                  cx: float, cz: float, heatmap_res: int,
-                                  placement_plane: str = "floor",
-                                  scene: Optional[dict] = None,
-                                  top_k: int = 1,
-                                  min_distance: float = 0.5) -> list:
-    """Extract top-k positions from a fused score field (heatmap x mask).
-
-    Args:
-        score: 2D float tensor [heatmap_res, heatmap_res]
-        ortho_scale: orthographic scale in meters
-        cx, cz: room center
-        heatmap_res: grid resolution
-        placement_plane: "floor" or object jid
-        scene: optional scene data
-        top_k: number of candidates
-        min_distance: minimum distance between candidates
-
-    Returns:
-        List of [x, y, z] positions.
-    """
-    from utils.placement_mask import grid_to_world, _extract_objects
-
-    if not torch.any(score > 0):
-        return []
-
-    positions = []
-    working_score = score.clone()
-
-    for _ in range(top_k):
-        idx = torch.argmax(working_score.flatten()).item()
-        gi, gj = divmod(idx, heatmap_res)
-        x, z = grid_to_world(gi, gj, cx, cz, ortho_scale, heatmap_res)
-
-        if placement_plane == "floor":
-            y = 0.0
-        else:
-            y = 0.0
-            if scene:
-                objects = _extract_objects(scene)
-                for obj in objects:
-                    obj_id = obj.get('jid', '') or obj.get('uid', '')
-                    if obj_id == placement_plane:
-                        pos = obj.get('pos', [0, 0, 0])
-                        sz = obj.get('size', [1, 1, 1])
-                        y = pos[1] + sz[1] / 2
-                        break
-
-        positions.append([float(x), float(y), float(z)])
-
-        cell_size = ortho_scale / heatmap_res
-        radius_cells = max(1, int(min_distance / cell_size))
-        y1 = max(0, gi - radius_cells)
-        y2 = min(heatmap_res, gi + radius_cells + 1)
-        x1 = max(0, gj - radius_cells)
-        x2 = min(heatmap_res, gj + radius_cells + 1)
-        working_score[y1:y2, x1:x2] = 0
-
-    return positions
-
-
-def visualize_placement(score: torch.Tensor, top_view_path: str,
-                        positions: list, object_desc: str,
-                        ortho_scale: float, cx: float, cz: float,
-                        heatmap_res: int, save_path: str) -> None:
-    """Create a debug visualization overlaying the score field on the top view."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from PIL import Image
-    import numpy as np
-
-    top_img = Image.open(top_view_path).convert('RGB')
-
-    score_np = score.cpu().numpy()
-    score_resized = np.array(Image.fromarray(
-        (score_np * 255).astype(np.uint8)
-    ).resize((top_img.width, top_img.height), Image.BILINEAR)) / 255.0
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-    ax.imshow(top_img)
-
-    cmap = plt.cm.jet
-    heatmap_rgba = cmap(score_resized)
-    heatmap_rgba[..., 3] = 0.4
-    ax.imshow(heatmap_rgba)
-
-    for i, pos in enumerate(positions):
-        px, pz = pos[0], pos[2]
-        u = ((px - cx) / ortho_scale + 0.5) * top_img.width
-        v = ((pz - cz) / ortho_scale + 0.5) * top_img.height
-        ax.plot(u, v, 'rX', markersize=15, linewidth=2,
-                label=f'#{i+1} ({px:.2f}, {pz:.2f})' if i == 0 else f'#{i+1}')
-
-    ax.set_title(f'Placement: "{object_desc}"\nScore = Heatmap x FeasibleMask')
-    ax.legend(loc='upper right', fontsize=8)
-    ax.axis('off')
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-    print(f"[placement] Visualization saved to {save_path}")

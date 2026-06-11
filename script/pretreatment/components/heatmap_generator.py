@@ -3,16 +3,16 @@ GT 热力图生成模块 (正交投影, 图像像素约定)
 
 生成的 GT 热力图与渲染的房间俯视图像素一一对应:
   heatmap[row, col] 其中:
-    row (第一轴) → world_z 方向, row=0 对应 max_z (图像顶部)
+    row (第一轴) → world_z 方向, row=0 对应 min_z (图像顶部)
     col (第二轴) → world_x 方向, col=0 对应 min_x (图像左侧)
 
 像素映射 (与 renderer.py 一致):
   col = ((world_x - cx) / ortho_scale + 0.5) * image_size
-  row = ((cz - world_z) / ortho_scale + 0.5) * image_size
+  row = ((world_z - cz) / ortho_scale + 0.5) * image_size
 
 反变换:
   world_x = cx + (col / image_size - 0.5) * ortho_scale
-  world_z = cz - (row / image_size - 0.5) * ortho_scale
+  world_z = cz + (row / image_size - 0.5) * ortho_scale
 
 推理时 placement_mask 也需要使用相同的图像像素约定,
 score = heatmap * mask 才能正确逐元素相乘。
@@ -58,7 +58,7 @@ class HeatmapGenerator:
             (pixel_row, pixel_col) 浮点像素坐标
         """
         pixel_col = ((world_x - cx) / ortho_scale + 0.5) * self.image_size
-        pixel_row = ((cz - world_z) / ortho_scale + 0.5) * self.image_size
+        pixel_row = ((world_z - cz) / ortho_scale + 0.5) * self.image_size
         return pixel_row, pixel_col
 
     def generate(
@@ -70,7 +70,7 @@ class HeatmapGenerator:
         """生成 GT 高斯热力图 (图像像素约定)
 
         输出 heatmap[row, col] 与渲染的房间俯视图像素一一对应:
-          - row=0 在图像顶部 (对应 max world_z)
+          - row=0 在图像顶部 (对应 min world_z)
           - col=0 在图像左侧 (对应 min world_x)
 
         Args:

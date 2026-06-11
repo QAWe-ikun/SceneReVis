@@ -11,12 +11,14 @@ export PTH_3DFUTURE_ASSETS="/mnt/d/3D-Dataset/3D-FUTURE-model"
 export PTH_ASSETS_METADATA="${PROJECT_ROOT}/metadata/model_info_3dfuture_assets.json"
 export PTH_ASSETS_METADATA_SCALED="${PROJECT_ROOT}/metadata/model_info_3dfuture_assets_scaled.json"
 export PTH_ASSETS_EMBED="${PROJECT_ROOT}/metadata/model_info_3dfuture_assets_embeds.pickle"
+export SCENEREVIS_SIGLIP_MODEL="${PROJECT_ROOT}/ckpt/google/siglip-so400m-patch14-384"
 
 echo "✓ Environment variables set:"
 echo "  PTH_3DFUTURE_ASSETS: $PTH_3DFUTURE_ASSETS"
 echo "  PTH_ASSETS_METADATA: $PTH_ASSETS_METADATA"
 echo "  PTH_ASSETS_METADATA_SCALED: $PTH_ASSETS_METADATA_SCALED"
 echo "  PTH_ASSETS_EMBED: $PTH_ASSETS_EMBED"
+echo "  SCENEREVIS_SIGLIP_MODEL: $SCENEREVIS_SIGLIP_MODEL"
 echo ""
 echo "Verifying file existence..."
 
@@ -42,6 +44,12 @@ if [ -f "$PTH_ASSETS_EMBED" ]; then
     echo "  ✓ Asset embedding file exists"
 else
     echo "  ✗ Asset embedding file does not exist: $PTH_ASSETS_EMBED"
+fi
+
+if [ -d "$SCENEREVIS_SIGLIP_MODEL" ]; then
+    echo "  ✓ SigLIP model directory exists"
+else
+    echo "  ✗ SigLIP model directory does not exist: $SCENEREVIS_SIGLIP_MODEL"
 fi
 
 echo ""

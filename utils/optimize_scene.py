@@ -97,7 +97,7 @@ class SceneOptimizer:
             return False
 
         from utils.placement_mask import compute_mask, find_best_position, grid_to_world
-        from utils.placement_heatmap import PlacementEngine
+        from utils.placement_engine import PlacementEngine
 
         # Get object description for heatmap query
         desc = get_object_field(obj, 'desc', self.format_type) or obj.get('desc', 'furniture')

@@ -40,7 +40,11 @@ from tqdm import tqdm
 # 添加项目根目录到 path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from utils.placement_heatmap import PlacementHeatmap
+from utils.placement_heatmap import (
+    PlacementHeatmap,
+    load_trainable_heatmap_state_dict,
+    trainable_heatmap_state_dict,
+)
 
 
 # ============================================================================
@@ -117,6 +121,47 @@ class HeatmapDataset(Dataset):
         return result
 
 
+def heatmap_collate_fn(batch: List[Dict]) -> Dict:
+    """Collate tensors for training while keeping metadata as plain lists."""
+    result = {
+        "room_image": torch.stack([item["room_image"] for item in batch]),
+        "object_image": torch.stack([item["object_image"] for item in batch]),
+        "mask": torch.stack([item["mask"] for item in batch]),
+        "object_desc": [item["object_desc"] for item in batch],
+        "sample_id": [item["sample_id"] for item in batch],
+    }
+
+    for key in ("scene_name", "removed_object", "text_source"):
+        if any(key in item for item in batch):
+            result[key] = [item.get(key) for item in batch]
+
+    return result
+
+
+def heatmap_bce_loss(
+    pred_heatmap: torch.Tensor,
+    target_heatmap: torch.Tensor,
+    pos_weight: float,
+) -> torch.Tensor:
+    """Weighted BCE loss for sparse Gaussian placement heatmaps."""
+    weight = torch.where(
+        target_heatmap > 0.1,
+        torch.as_tensor(pos_weight, device=target_heatmap.device),
+        torch.as_tensor(1.0, device=target_heatmap.device),
+    )
+    return F.binary_cross_entropy(pred_heatmap, target_heatmap, weight=weight)
+
+
+def peak_distance(pred_heatmap: torch.Tensor, target_heatmap: torch.Tensor) -> float:
+    """Return argmax distance in heatmap pixels for a single prediction."""
+    pred_peak = torch.argmax(pred_heatmap.flatten()).item()
+    gt_peak = torch.argmax(target_heatmap.flatten()).item()
+    W = pred_heatmap.shape[-1]
+    pred_y, pred_x = divmod(pred_peak, W)
+    gt_y, gt_x = divmod(gt_peak, W)
+    return ((pred_y - gt_y) ** 2 + (pred_x - gt_x) ** 2) ** 0.5
+
+
 # ============================================================================
 # Training Loop
 # ============================================================================
@@ -128,7 +173,9 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     batch_scheduler=None,
-) -> float:
+    pos_weight: float = 10.0,
+    peak_tolerance: float = 32.0,
+) -> tuple[float, float]:
     """训练一个 epoch
 
     Args:
@@ -176,21 +223,13 @@ def train_one_epoch(
                 align_corners=False
             ).squeeze(1)  # [1, H, W]
 
-            loss = F.binary_cross_entropy(
-                pred_heatmap, mask_resized,
-                weight=torch.where(mask_resized > 0.1, torch.tensor(10.0, device=device), torch.tensor(1.0, device=device)),
-            )
+            loss = heatmap_bce_loss(pred_heatmap, mask_resized, pos_weight=pos_weight)
             batch_loss += loss
 
             # 统计峰值准确率
             with torch.no_grad():
-                pred_peak = torch.argmax(pred_heatmap[0].flatten()).item()
-                gt_peak = torch.argmax(mask_resized[0].flatten()).item()
-                H = pred_heatmap.shape[-1]
-                pred_y, pred_x = divmod(pred_peak, H)
-                gt_y, gt_x = divmod(gt_peak, H)
-                dist = ((pred_y - gt_y) ** 2 + (pred_x - gt_x) ** 2) ** 0.5
-                if dist < 32:
+                dist = peak_distance(pred_heatmap[0], mask_resized[0])
+                if dist < peak_tolerance:
                     peak_correct += 1
                 peak_total += 1
 
@@ -218,7 +257,9 @@ def train_one_epoch(
             "lr": f"{current_lr:.1e}",
         })
 
-    return total_loss / num_batches
+    avg_loss = total_loss / num_batches
+    peak_acc = peak_correct / peak_total if peak_total > 0 else 0.0
+    return avg_loss, peak_acc
 
 
 @torch.no_grad()
@@ -227,6 +268,8 @@ def validate(
     dataloader: DataLoader,
     device: torch.device,
     epoch: int,
+    pos_weight: float = 10.0,
+    peak_tolerance: float = 32.0,
 ) -> tuple[float, float]:
     """验证，返回 (loss, peak_accuracy)
 
@@ -268,19 +311,12 @@ def validate(
                 align_corners=False
             ).squeeze(1)
 
-            loss = F.binary_cross_entropy(
-                pred_heatmap, mask_resized,
-                weight=torch.where(mask_resized > 0.1, torch.tensor(5.0, device=device), torch.tensor(1.0, device=device)),
-            )
+            loss = heatmap_bce_loss(pred_heatmap, mask_resized, pos_weight=pos_weight)
             batch_loss += loss
 
             # 计算峰值准确率
-            pred_peak = torch.argmax(pred_heatmap[0].flatten()).item()
-            gt_peak = torch.argmax(mask_resized[0].flatten()).item()
-            pred_y, pred_x = divmod(pred_peak, pred_heatmap.shape[-1])
-            gt_y, gt_x = divmod(gt_peak, mask_resized.shape[-1])
-            dist = ((pred_y - gt_y) ** 2 + (pred_x - gt_x) ** 2) ** 0.5
-            if dist < 32:  # 32 像素容差
+            dist = peak_distance(pred_heatmap[0], mask_resized[0])
+            if dist < peak_tolerance:
                 peak_correct += 1
             peak_total += 1
 
@@ -311,6 +347,12 @@ def main():
     parser.add_argument("--image_size", type=int, default=384, help="图像分辨率 (应匹配 SigLIP 输入)")
     parser.add_argument("--resume", type=str, default=None, help="恢复训练的检查点路径")
     parser.add_argument("--log_interval", type=int, default=10, help="日志间隔")
+    parser.add_argument("--pos_weight", type=float, default=10.0,
+                       help="GT heatmap positive-region BCE weight")
+    parser.add_argument("--peak_tolerance", type=float, default=32.0,
+                       help="Peak accuracy tolerance in 256x256 heatmap pixels")
+    parser.add_argument("--early_stop_patience", type=int, default=0,
+                       help="Stop after N epochs without val-loss improvement; 0 disables")
     parser.add_argument("--test_lr", action="store_true",
                        help="LR 测试模式: 1 epoch 内 cosine 衰减, 快速观察不同 lr 效果")
     args = parser.parse_args()
@@ -348,6 +390,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=heatmap_collate_fn,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -355,6 +398,7 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=heatmap_collate_fn,
     )
 
     # 模型
@@ -381,14 +425,29 @@ def main():
     # 恢复训练
     start_epoch = 0
     best_val_loss = float('inf')
+    best_peak_acc = 0.0
+    epochs_without_improvement = 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        missing_keys, unexpected_keys = load_trainable_heatmap_state_dict(
+            model,
+            checkpoint["model_state_dict"],
+        )
+        if missing_keys or unexpected_keys:
+            logging.warning(
+                "Checkpoint loaded with missing_keys=%s, unexpected_keys=%s",
+                missing_keys,
+                unexpected_keys,
+            )
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
         best_val_loss = checkpoint.get("best_val_loss", float('inf'))
-        logging.info(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+        best_peak_acc = checkpoint.get("best_peak_acc", 0.0)
+        logging.info(
+            f"Resumed from epoch {start_epoch}, "
+            f"best_val_loss={best_val_loss:.4f}, best_peak_acc={best_peak_acc:.2%}"
+        )
 
     # 训练循环
     for epoch in range(start_epoch, args.epochs):
@@ -399,11 +458,27 @@ def main():
         # 训练
         # test_lr 模式: 传入 scheduler, 每个 batch 后步进学习率
         batch_scheduler = scheduler if args.test_lr else None
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch+1, batch_scheduler)
-        logging.info(f"Train Loss: {train_loss:.4f}")
+        train_loss, train_peak_acc = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch + 1,
+            batch_scheduler,
+            pos_weight=args.pos_weight,
+            peak_tolerance=args.peak_tolerance,
+        )
+        logging.info(f"Train Loss: {train_loss:.4f}, Peak Acc: {train_peak_acc:.2%}")
 
         # 验证
-        val_loss, peak_acc = validate(model, val_loader, device, epoch+1)
+        val_loss, peak_acc = validate(
+            model,
+            val_loader,
+            device,
+            epoch + 1,
+            pos_weight=args.pos_weight,
+            peak_tolerance=args.peak_tolerance,
+        )
         logging.info(f"Val Loss: {val_loss:.4f}, Peak Acc: {peak_acc:.2%}")
 
         # 更新学习率 (test_lr 模式已在 batch 内步进, 跳过 epoch 级调度)
@@ -415,29 +490,50 @@ def main():
         # 保存检查点
         checkpoint = {
             "epoch": epoch,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": trainable_heatmap_state_dict(model),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_val_loss": best_val_loss,
+            "best_peak_acc": best_peak_acc,
             "args": vars(args),
         }
-
-        # 保存最新检查点
-        torch.save(checkpoint, output_dir / "latest.pth")
 
         # 保存最佳检查点
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             checkpoint["best_val_loss"] = best_val_loss
             torch.save(checkpoint, output_dir / "best.pth")
             logging.info(f"✓ New best model saved (val_loss={val_loss:.4f})")
+        else:
+            epochs_without_improvement += 1
+
+        if peak_acc > best_peak_acc:
+            best_peak_acc = peak_acc
+            checkpoint["best_peak_acc"] = best_peak_acc
+            torch.save(checkpoint, output_dir / "best_peak.pth")
+            logging.info(f"✓ New best peak model saved (peak_acc={peak_acc:.2%})")
+
+        checkpoint["best_val_loss"] = best_val_loss
+        checkpoint["best_peak_acc"] = best_peak_acc
+
+        # 保存最新检查点
+        torch.save(checkpoint, output_dir / "latest.pth")
 
         # 定期保存
         if (epoch + 1) % 10 == 0:
             torch.save(checkpoint, output_dir / f"epoch_{epoch+1}.pth")
 
+        if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
+            logging.info(
+                f"Early stopping: no val-loss improvement for "
+                f"{epochs_without_improvement} epochs"
+            )
+            break
+
     logging.info(f"\n{'='*60}")
     logging.info(f"Training completed! Best val loss: {best_val_loss:.4f}")
+    logging.info(f"Best peak accuracy: {best_peak_acc:.2%}")
     logging.info(f"Checkpoints saved to: {output_dir}")
     logging.info(f"{'='*60}")
 

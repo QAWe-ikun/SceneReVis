@@ -95,4 +95,4 @@ docs/
 checkpoints/
 
 # Visualization outputs
-visualizations/
+visualizations**/

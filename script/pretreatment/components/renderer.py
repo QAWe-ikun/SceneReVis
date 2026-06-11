@@ -9,9 +9,9 @@
 
 像素映射 (线性, 图像约定):
   col = ((world_x - cx) / ortho_scale + 0.5) * image_size   # 列 → world X
-  row = ((cz - world_z) / ortho_scale + 0.5) * image_size   # 行 → world Z (反向)
+  row = ((world_z - cz) / ortho_scale + 0.5) * image_size   # 行 → world Z
 
-  即: col=0 对应 min_x (图像左侧), row=0 对应 max_z (图像顶部)
+  即: col=0 对应 min_x (图像左侧), row=0 对应 min_z (图像顶部)
 """
 import os
 import logging

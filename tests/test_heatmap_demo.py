@@ -11,7 +11,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from utils.placement_mask import compute_mask, find_best_position, grid_to_world, world_to_grid
-from utils.placement_heatmap import PlacementEngine
+from utils.placement_engine import PlacementEngine
 
 
 def demo_mask(scene_path, res=256, clearance=0.5):

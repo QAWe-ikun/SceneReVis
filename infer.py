@@ -1485,7 +1485,7 @@ def _get_placement_engine(top_view_path: str, heatmap_res: int = 256, enable_hea
     """Lazy-initialize the placement engine singleton."""
     global _placement_engine
     if _placement_engine is None:
-        from utils.placement_heatmap import PlacementEngine
+        from utils.placement_engine import PlacementEngine
         _placement_engine = PlacementEngine(heatmap_res=heatmap_res, enable_heatmap=enable_heatmap)
     return _placement_engine
 
