@@ -22,6 +22,7 @@ import sys
 import json
 import argparse
 import logging
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List
@@ -41,7 +42,11 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from utils.placement_heatmap import (
+    DINO_IMAGE_SIZE,
+    SIGLIP_IMAGE_SIZE,
     PlacementHeatmap,
+    build_dino_image_transform,
+    build_siglip_image_transform,
     load_trainable_heatmap_state_dict,
     trainable_heatmap_state_dict,
 )
@@ -54,7 +59,15 @@ from utils.placement_heatmap import (
 class HeatmapDataset(Dataset):
     """热力图训练数据集"""
 
-    def __init__(self, data_dir: Path, split: str = "train", image_size: int = 384):
+    def __init__(
+        self,
+        data_dir: Path,
+        split: str = "train",
+        image_size: int = SIGLIP_IMAGE_SIZE,
+        room_encoder: str = "siglip",
+        room_image_size: int | None = None,
+        object_image_size: int | None = None,
+    ):
         """
         Args:
             data_dir: 数据根目录
@@ -64,6 +77,11 @@ class HeatmapDataset(Dataset):
         self.data_dir = Path(data_dir)
         self.split = split
         self.image_size = image_size
+        self.room_encoder = room_encoder.lower()
+        self.room_image_size = room_image_size or (
+            DINO_IMAGE_SIZE if self.room_encoder == "dinov2" else image_size
+        )
+        self.object_image_size = object_image_size or image_size
 
         # 加载元数据
         json_path = self.data_dir / split / f"{split}.json"
@@ -74,11 +92,11 @@ class HeatmapDataset(Dataset):
 
         # 图像预处理 (SigLIP 标准)
         # 注意：图像会被 resize 到 image_size (默认 384，匹配 SigLIP 输入)
-        self.transform = T.Compose([
-            T.Resize((image_size, image_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        if self.room_encoder == "dinov2":
+            self.room_transform = build_dino_image_transform(self.room_image_size)
+        else:
+            self.room_transform = build_siglip_image_transform(self.room_image_size)
+        self.object_transform = build_siglip_image_transform(self.object_image_size)
 
     def __len__(self):
         return len(self.samples)
@@ -90,12 +108,12 @@ class HeatmapDataset(Dataset):
         # 加载房间俯视图
         room_path = scene_dir / sample["plane_image_path"]
         room_img = Image.open(room_path).convert("RGB")
-        room_tensor = self.transform(room_img)
+        room_tensor = self.room_transform(room_img)
 
         # 加载物体参考图
         object_path = scene_dir / sample["object_image_path"]
         object_img = Image.open(object_path).convert("RGB")
-        object_tensor = self.transform(object_img)
+        object_tensor = self.object_transform(object_img)
 
         # 加载 GT 热力图 (mask)
         mask_path = scene_dir / sample["mask_path"]
@@ -175,6 +193,7 @@ def train_one_epoch(
     batch_scheduler=None,
     pos_weight: float = 10.0,
     peak_tolerance: float = 32.0,
+    peak_window: int = 200,
 ) -> tuple[float, float]:
     """训练一个 epoch
 
@@ -186,6 +205,8 @@ def train_one_epoch(
     num_batches = 0
     peak_correct = 0
     peak_total = 0
+    recent_peak = deque(maxlen=max(1, peak_window))
+    recent_dist = deque(maxlen=max(1, peak_window))
 
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]", leave=False)
 
@@ -229,9 +250,12 @@ def train_one_epoch(
             # 统计峰值准确率
             with torch.no_grad():
                 dist = peak_distance(pred_heatmap[0], mask_resized[0])
-                if dist < peak_tolerance:
+                is_correct = dist < peak_tolerance
+                if is_correct:
                     peak_correct += 1
                 peak_total += 1
+                recent_peak.append(float(is_correct))
+                recent_dist.append(dist)
 
         batch_loss = batch_loss / batch_size
         batch_loss.backward()
@@ -246,13 +270,17 @@ def train_one_epoch(
 
         avg_loss = total_loss / num_batches
         peak_acc = peak_correct / peak_total if peak_total > 0 else 0.0
+        recent_peak_acc = sum(recent_peak) / len(recent_peak) if recent_peak else 0.0
+        recent_dist_avg = sum(recent_dist) / len(recent_dist) if recent_dist else 0.0
         hm_min = pred_heatmap.min().item()
         hm_max = pred_heatmap.max().item()
 
         progress_bar.set_postfix({
             "loss": f"{batch_loss.item():.4f}",
             "avg": f"{avg_loss:.4f}",
-            "peak": f"{peak_acc:.0%}",
+            "peak": f"{peak_acc:.2%}",
+            f"p{peak_window}": f"{recent_peak_acc:.2%}",
+            f"d{peak_window}": f"{recent_dist_avg:.1f}",
             "hm": f"[{hm_min:.2f},{hm_max:.2f}]",
             "lr": f"{current_lr:.1e}",
         })
@@ -351,10 +379,22 @@ def main():
                        help="GT heatmap positive-region BCE weight")
     parser.add_argument("--peak_tolerance", type=float, default=32.0,
                        help="Peak accuracy tolerance in 256x256 heatmap pixels")
+    parser.add_argument("--peak_window", type=int, default=200,
+                       help="Recent sample window for train progress peak/distance diagnostics")
     parser.add_argument("--early_stop_patience", type=int, default=0,
                        help="Stop after N epochs without val-loss improvement; 0 disables")
     parser.add_argument("--test_lr", action="store_true",
                        help="LR 测试模式: 1 epoch 内 cosine 衰减, 快速观察不同 lr 效果")
+    parser.add_argument("--room_encoder", type=str, default="siglip", choices=["siglip", "dinov2"],
+                       help="Room/top-view encoder: siglip or dinov2")
+    parser.add_argument("--dino_model", type=str, default=None,
+                       help="DINOv2 model path or HF id for room_encoder=dinov2")
+    parser.add_argument("--room_image_size", type=int, default=None,
+                       help="Room image input size; defaults to 518 for DINOv2 and image_size for SigLIP")
+    parser.add_argument("--object_image_size", type=int, default=None,
+                       help="Object image input size; defaults to image_size")
+    parser.add_argument("--hidden_dim", type=int, default=256,
+                       help="Trainable attention hidden dimension")
     args = parser.parse_args()
 
     # 设置日志
@@ -381,8 +421,26 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 数据集
-    train_dataset = HeatmapDataset(Path(args.data_dir), split="train", image_size=args.image_size)
-    val_dataset = HeatmapDataset(Path(args.data_dir), split="val", image_size=args.image_size)
+    room_image_size = args.room_image_size or (
+        DINO_IMAGE_SIZE if args.room_encoder == "dinov2" else args.image_size
+    )
+    object_image_size = args.object_image_size or args.image_size
+    train_dataset = HeatmapDataset(
+        Path(args.data_dir),
+        split="train",
+        image_size=args.image_size,
+        room_encoder=args.room_encoder,
+        room_image_size=room_image_size,
+        object_image_size=object_image_size,
+    )
+    val_dataset = HeatmapDataset(
+        Path(args.data_dir),
+        split="val",
+        image_size=args.image_size,
+        room_encoder=args.room_encoder,
+        room_image_size=room_image_size,
+        object_image_size=object_image_size,
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -402,7 +460,14 @@ def main():
     )
 
     # 模型
-    model = PlacementHeatmap(heatmap_res=256).to(device)
+    model = PlacementHeatmap(
+        heatmap_res=256,
+        room_encoder=args.room_encoder,
+        dino_model=args.dino_model,
+        hidden_dim=args.hidden_dim,
+        room_image_size=room_image_size,
+        object_image_size=object_image_size,
+    ).to(device)
     logging.info(f"Model initialized: {sum(p.numel() for p in model.parameters()):,} parameters")
 
     # 优化器
@@ -467,6 +532,7 @@ def main():
             batch_scheduler,
             pos_weight=args.pos_weight,
             peak_tolerance=args.peak_tolerance,
+            peak_window=args.peak_window,
         )
         logging.info(f"Train Loss: {train_loss:.4f}, Peak Acc: {train_peak_acc:.2%}")
 

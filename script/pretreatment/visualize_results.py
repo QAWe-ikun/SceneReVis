@@ -161,15 +161,17 @@ class Qwen3VLCoordinateBaseline:
         self,
         model_path: str,
         backend: str = "vllm",
-        max_tokens: int = 128,
+        max_tokens: int = 768,
         temperature: float = 0.0,
         cache_path: Optional[Path] = None,
+        refresh_cache: bool = False,
     ):
         self.model_path = Path(model_path)
         self.backend = backend
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.cache_path = Path(cache_path) if cache_path else None
+        self.refresh_cache = refresh_cache
         self._model = None
         self._processor = None
         self._vllm_engine = None
@@ -262,6 +264,7 @@ class Qwen3VLCoordinateBaseline:
             f"{desc}\n\n"
             "### Output Format Requirements\n\n"
             "You must follow the SceneReVis editing format exactly: first `<think>`, then `<tool_calls>`.\n"
+            "Keep `<think>` concise so the complete `<tool_calls>` block is always emitted. "
             "Return exactly one `add_object` call. Do not use markdown fences.\n\n"
             "<think>\n"
             "[Briefly analyze the top-down room view, free space, surrounding furniture, and the best placement point.]\n"
@@ -339,9 +342,6 @@ class Qwen3VLCoordinateBaseline:
             except Exception:
                 pass
 
-        nums = re.findall(r"-?\d+(?:\.\d+)?", text)
-        if len(nums) >= 2:
-            return normalize_coord([nums[-2], nums[-1]])
         return None
 
     def _save_cache(self):
@@ -361,7 +361,7 @@ class Qwen3VLCoordinateBaseline:
         desc: str,
         cache_key: str,
     ) -> Tuple[Optional[Tuple[float, float]], Optional[str]]:
-        if cache_key in self._cache:
+        if not self.refresh_cache and cache_key in self._cache:
             cached = self._cache[cache_key]
             coord = cached.get("coord")
             if coord is not None:
@@ -552,15 +552,9 @@ def visualize_sample(
         if original_path.exists():
             original_img = Image.open(original_path).convert("RGB")
 
-    # Preprocess
-    transform = T.Compose([
-        T.Resize((image_size, image_size)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
-
-    room_tensor = transform(room_img).unsqueeze(0).to(device)
-    object_tensor = transform(object_img).unsqueeze(0).to(device)
+    # Preprocess room/object separately so DINOv2 room encoders use their own normalization.
+    room_tensor = model.preprocess_room_image(room_img).unsqueeze(0).to(device)
+    object_tensor = model.preprocess_object_image(object_img).unsqueeze(0).to(device)
     mask_tensor = T.functional.to_tensor(mask_img).unsqueeze(0).to(device)
 
     # Inference
@@ -603,7 +597,11 @@ def visualize_sample(
     qwen_response = None
     if qwen3_baseline is not None:
         try:
-            cache_key = f"scenerevis_prompt_v2_{sample.get('sample_id', '')}_{sample.get('text_source', '')}_{sample.get('object_desc', '')[:80]}"
+            cache_key = (
+                f"scenerevis_prompt_v2_mt{qwen3_baseline.max_tokens}_"
+                f"{sample.get('sample_id', '')}_{sample.get('text_source', '')}_"
+                f"{sample.get('object_desc', '')[:80]}"
+            )
             qwen_peak_overlay, qwen_response = qwen3_baseline.predict(
                 room_img=room_img,
                 object_img=object_img,
@@ -740,17 +738,29 @@ def main():
     parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to visualize")
     parser.add_argument("--output_dir", type=str, default="visualizations", help="Output directory")
     parser.add_argument("--image_size", type=int, default=384, help="Image resolution")
+    parser.add_argument("--room_encoder", type=str, default=None, choices=["siglip", "dinov2"],
+                        help="Room/top-view encoder used by the checkpoint")
+    parser.add_argument("--dino_model", type=str, default=None,
+                        help="DINOv2 model path or HF id for room_encoder=dinov2")
+    parser.add_argument("--room_image_size", type=int, default=None,
+                        help="Room image input size; defaults to 518 for DINOv2 and image_size for SigLIP")
+    parser.add_argument("--object_image_size", type=int, default=None,
+                        help="Object image input size; defaults to image_size")
+    parser.add_argument("--hidden_dim", type=int, default=None,
+                        help="Trainable attention hidden dimension used by the checkpoint")
     parser.add_argument("--split", type=str, default="val", help="Dataset split (train/val/test)")
     parser.add_argument("--qwen3-vl-model", type=str, default="/mnt/f/models/qwen3_vl",
                         help="Qwen3-VL model path for coordinate baseline")
     parser.add_argument("--qwen3-vl-backend", type=str, default="vllm",
                         choices=["vllm", "transformers"], help="Qwen3-VL inference backend")
-    parser.add_argument("--qwen3-vl-max-tokens", type=int, default=128,
+    parser.add_argument("--qwen3-vl-max-tokens", type=int, default=768,
                         help="Maximum new tokens for Qwen3-VL coordinate baseline")
     parser.add_argument("--disable-qwen3-vl-baseline", action="store_true",
                         help="Disable Qwen3-VL coordinate baseline")
     parser.add_argument("--qwen3-vl-cache", type=str, default=None,
                         help="Cache file for Qwen3-VL coordinate predictions")
+    parser.add_argument("--refresh-qwen3-vl-cache", action="store_true",
+                        help="Ignore existing Qwen3-VL coordinate cache and regenerate predictions")
     parser.add_argument("--legacy-flip-gt-z", action="store_true",
                         help="Flip old GT heatmaps vertically for datasets generated before the Z-axis fix")
     args = parser.parse_args()
@@ -785,8 +795,37 @@ def main():
     else:
         selected_samples = samples[:args.num_samples]
 
+    checkpoint_meta = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint_args = checkpoint_meta.get("args", {})
+    room_encoder = args.room_encoder or checkpoint_args.get("room_encoder", "siglip")
+    dino_model = args.dino_model or checkpoint_args.get("dino_model")
+    hidden_dim = args.hidden_dim or checkpoint_args.get("hidden_dim", 256)
+    room_image_size = args.room_image_size or checkpoint_args.get("room_image_size")
+    object_image_size = (
+        args.object_image_size
+        or checkpoint_args.get("object_image_size")
+        or checkpoint_args.get("image_size")
+        or args.image_size
+    )
+    logging.info(
+        "Heatmap model config: room_encoder=%s, dino_model=%s, hidden_dim=%s, "
+        "room_image_size=%s, object_image_size=%s",
+        room_encoder,
+        dino_model,
+        hidden_dim,
+        room_image_size,
+        object_image_size,
+    )
+
     # Load model
-    model = PlacementHeatmap(heatmap_res=256).to(device)
+    model = PlacementHeatmap(
+        heatmap_res=256,
+        room_encoder=room_encoder,
+        dino_model=dino_model,
+        hidden_dim=hidden_dim,
+        room_image_size=room_image_size,
+        object_image_size=object_image_size,
+    ).to(device)
     model = load_checkpoint(model, args.checkpoint, device)
 
     qwen3_baseline = None
@@ -800,9 +839,12 @@ def main():
                 max_tokens=args.qwen3_vl_max_tokens,
                 temperature=0.0,
                 cache_path=cache_path,
+                refresh_cache=args.refresh_qwen3_vl_cache,
             )
             logging.info(f"Qwen3-VL coordinate baseline enabled: {qwen3_model_path}")
             logging.info(f"Qwen3-VL coordinate cache: {cache_path}")
+            logging.info(f"Qwen3-VL max new tokens: {args.qwen3_vl_max_tokens}")
+            logging.info(f"Qwen3-VL refresh cache: {args.refresh_qwen3_vl_cache}")
         else:
             logging.warning(f"Qwen3-VL model path not found, baseline disabled: {qwen3_model_path}")
 

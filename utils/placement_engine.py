@@ -21,12 +21,18 @@ class PlacementEngine:
         self.enable_heatmap = enable_heatmap
         self.heatmap_model = heatmap_model
 
-    def _preprocess_image(self, image_path: str) -> torch.Tensor:
+    def _preprocess_image(self, image_path: str, kind: str = "room") -> torch.Tensor:
         if self.heatmap_model is None:
             raise ValueError("heatmap_model is required for image preprocessing")
         device = next(self.heatmap_model.parameters()).device
         image = Image.open(image_path).convert("RGB")
-        return self.heatmap_model.vision_encoder.preprocess(image).unsqueeze(0).to(device)
+        if kind == "room" and hasattr(self.heatmap_model, "preprocess_room_image"):
+            tensor = self.heatmap_model.preprocess_room_image(image)
+        elif kind == "object" and hasattr(self.heatmap_model, "preprocess_object_image"):
+            tensor = self.heatmap_model.preprocess_object_image(image)
+        else:
+            tensor = self.heatmap_model.vision_encoder.preprocess(image)
+        return tensor.unsqueeze(0).to(device)
 
     def compute_heatmap(
         self,
@@ -37,8 +43,8 @@ class PlacementEngine:
         if not self.enable_heatmap or self.heatmap_model is None:
             return torch.ones(self.heatmap_res, self.heatmap_res)
 
-        room_tensor = self._preprocess_image(room_image_path)
-        object_tensor = self._preprocess_image(object_image_path)
+        room_tensor = self._preprocess_image(room_image_path, kind="room")
+        object_tensor = self._preprocess_image(object_image_path, kind="object")
 
         self.heatmap_model.eval()
         with torch.no_grad():

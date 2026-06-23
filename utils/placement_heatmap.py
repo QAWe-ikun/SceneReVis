@@ -18,6 +18,7 @@ Architecture:
 """
 
 import os
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -26,10 +27,85 @@ from typing import Optional, Tuple
 import torchvision.transforms as T
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+REMOTE_SIGLIP_MODEL = "google/siglip-so400m-patch14-384"
+REMOTE_DINOV2_MODEL = "facebook/dinov2-base"
+DEFAULT_LOCAL_SIGLIP_MODEL = PROJECT_ROOT / "ckpt" / "google" / "siglip-so400m-patch14-384"
+DEFAULT_LOCAL_DINOV2_MODEL = PROJECT_ROOT / "ckpt" / "facebook" / "dinov2-base"
+
+SIGLIP_IMAGE_SIZE = 384
+DINO_IMAGE_SIZE = 518
+SIGLIP_MEAN = [0.5, 0.5, 0.5]
+SIGLIP_STD = [0.5, 0.5, 0.5]
+DINO_MEAN = [0.485, 0.456, 0.406]
+DINO_STD = [0.229, 0.224, 0.225]
+
 FROZEN_ENCODER_STATE_PREFIXES = (
+    "room_encoder.model.",
     "vision_encoder.model.",
     "text_encoder.model.",
 )
+
+
+def resolve_model_path(
+    explicit_model: Optional[str],
+    env_var: str,
+    default_local: Path,
+    default_remote: str,
+) -> str:
+    """Resolve a model id/path, preferring explicit args, env vars, then local ckpt."""
+    requested = explicit_model or os.environ.get(env_var)
+    if requested:
+        requested_path = Path(requested).expanduser()
+        if requested_path.exists():
+            return str(requested_path)
+        if requested_path.is_absolute() or requested.startswith(("~", ".")) or "\\" in requested:
+            raise FileNotFoundError(
+                f"{env_var if not explicit_model else 'model path'} points to a missing path: "
+                f"{requested_path}"
+            )
+        return requested
+    if default_local.exists():
+        return str(default_local)
+    return default_remote
+
+
+def is_local_model_path(model_name: str) -> bool:
+    return Path(model_name).expanduser().exists()
+
+
+def resolve_siglip_model(model_name: Optional[str] = None) -> str:
+    return resolve_model_path(
+        model_name,
+        "SCENEREVIS_SIGLIP_MODEL",
+        DEFAULT_LOCAL_SIGLIP_MODEL,
+        REMOTE_SIGLIP_MODEL,
+    )
+
+
+def resolve_dinov2_model(model_name: Optional[str] = None) -> str:
+    return resolve_model_path(
+        model_name,
+        "SCENEREVIS_DINOV2_MODEL",
+        DEFAULT_LOCAL_DINOV2_MODEL,
+        REMOTE_DINOV2_MODEL,
+    )
+
+
+def build_siglip_image_transform(image_size: int = SIGLIP_IMAGE_SIZE):
+    return T.Compose([
+        T.Resize((image_size, image_size)),
+        T.ToTensor(),
+        T.Normalize(mean=SIGLIP_MEAN, std=SIGLIP_STD),
+    ])
+
+
+def build_dino_image_transform(image_size: int = DINO_IMAGE_SIZE):
+    return T.Compose([
+        T.Resize((image_size, image_size)),
+        T.ToTensor(),
+        T.Normalize(mean=DINO_MEAN, std=DINO_STD),
+    ])
 
 
 def is_frozen_encoder_state_key(key: str) -> bool:
@@ -74,28 +150,28 @@ class SiglipVisionEncoder(nn.Module):
         model_name: HuggingFace model name, e.g. "google/siglip-so400m-patch14-384"
     """
 
-    def __init__(self, model_name: str = "google/siglip-so400m-patch14-384"):
+    def __init__(self, model_name: Optional[str] = None, image_size: Optional[int] = None):
         super().__init__()
         from transformers import SiglipVisionModel
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = SiglipVisionModel.from_pretrained(model_name).to(device)
+        model_name = resolve_siglip_model(model_name)
+        self.model = SiglipVisionModel.from_pretrained(
+            model_name,
+            local_files_only=is_local_model_path(model_name),
+        ).to(device)
 
         config = self.model.config
         self.feature_dim = config.hidden_size
         self.patch_size = config.patch_size
-        self.image_size = config.image_size
+        self.image_size = image_size or config.image_size
 
         # Freeze all weights
         for param in self.model.parameters():
             param.requires_grad = False
 
         # Preprocess: resize + normalize (SigLIP uses mean=0.5, std=0.5)
-        self.preprocess = T.Compose([
-            T.Resize((self.image_size, self.image_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        self.preprocess = build_siglip_image_transform(self.image_size)
 
         # Infer actual grid_size from a single forward pass
         dummy = torch.zeros(1, 3, self.image_size, self.image_size, device=device)
@@ -150,6 +226,74 @@ class SiglipVisionEncoder(nn.Module):
         return patch_tokens  # [B, 729, C]
 
 
+class DinoVisionEncoder(nn.Module):
+    """DINOv2 vision encoder for room top-view spatial features."""
+
+    def __init__(self, model_name: Optional[str] = None, image_size: int = DINO_IMAGE_SIZE):
+        super().__init__()
+        from transformers import AutoModel
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_name = resolve_dinov2_model(model_name)
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            local_files_only=is_local_model_path(model_name),
+        ).to(device)
+
+        config = self.model.config
+        self.feature_dim = config.hidden_size
+        self.patch_size = getattr(config, "patch_size", 14)
+        self.image_size = image_size
+
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        self.preprocess = build_dino_image_transform(self.image_size)
+
+        dummy = torch.zeros(1, 3, self.image_size, self.image_size, device=device)
+        with torch.no_grad():
+            outputs = self._forward_model(dummy)
+        patch_tokens = self._extract_patch_tokens(outputs.last_hidden_state)
+        self.num_patches = patch_tokens.shape[1]
+        self.grid_size = int(round(self.num_patches ** 0.5))
+        if self.grid_size * self.grid_size != self.num_patches:
+            raise ValueError(
+                f"DINOv2 patch token count is not square: {self.num_patches}"
+            )
+        print(
+            f"[DinoVisionEncoder] patches={self.num_patches}, "
+            f"grid={self.grid_size}x{self.grid_size}, dim={self.feature_dim}"
+        )
+
+        self.eval()
+
+    def _forward_model(self, pixel_values: torch.Tensor):
+        try:
+            return self.model(pixel_values=pixel_values, interpolate_pos_encoding=True)
+        except TypeError:
+            return self.model(pixel_values=pixel_values)
+
+    def _extract_patch_tokens(self, hidden: torch.Tensor) -> torch.Tensor:
+        seq_len = hidden.shape[1]
+        if int(round(seq_len ** 0.5)) ** 2 == seq_len:
+            return hidden
+
+        candidates = [1 + int(getattr(self.model.config, "num_register_tokens", 0)), 1]
+        for offset in candidates:
+            num_patches = seq_len - offset
+            if num_patches > 0 and int(round(num_patches ** 0.5)) ** 2 == num_patches:
+                return hidden[:, offset:, :]
+
+        raise ValueError(f"Cannot infer DINOv2 patch tokens from seq_len={seq_len}")
+
+    def encode_spatial(self, image: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            outputs = self._forward_model(image)
+        patch_tokens = self._extract_patch_tokens(outputs.last_hidden_state)
+        B = patch_tokens.shape[0]
+        return patch_tokens.reshape(B, self.grid_size, self.grid_size, self.feature_dim)
+
+
 # ============================================================================
 # SigLIP Text Encoder
 # ============================================================================
@@ -161,13 +305,21 @@ class SiglipTextEncoder(nn.Module):
         model_name: HuggingFace model name, e.g. "google/siglip-so400m-patch14-384"
     """
 
-    def __init__(self, model_name: str = "google/siglip-so400m-patch14-384"):
+    def __init__(self, model_name: Optional[str] = None):
         super().__init__()
         from transformers import SiglipTextModel, AutoTokenizer
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = SiglipTextModel.from_pretrained(model_name).to(device)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model_name = resolve_siglip_model(model_name)
+        local_files_only = is_local_model_path(model_name)
+        self.model = SiglipTextModel.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+        ).to(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+        )
 
         self.feature_dim = self.model.config.hidden_size
 
@@ -456,30 +608,57 @@ class PlacementHeatmap(nn.Module):
         所有编码保留原始序列维度。物体+文本作为整体序列全局自注意力。
     """
 
-    SIGLIP_MODEL = "google/siglip-so400m-patch14-384"
+    SIGLIP_MODEL = REMOTE_SIGLIP_MODEL
+    DINOV2_MODEL = REMOTE_DINOV2_MODEL
 
-    def __init__(self, siglip_model: str = None, heatmap_res: int = 256):
+    def __init__(
+        self,
+        siglip_model: str = None,
+        heatmap_res: int = 256,
+        room_encoder: str = "siglip",
+        dino_model: str = None,
+        hidden_dim: int = 256,
+        room_image_size: Optional[int] = None,
+        object_image_size: Optional[int] = None,
+    ):
         super().__init__()
         self.heatmap_res = heatmap_res
+        self.room_encoder_type = room_encoder.lower()
 
-        siglip_model = siglip_model or os.environ.get("SCENEREVIS_SIGLIP_MODEL") or self.SIGLIP_MODEL
+        if self.room_encoder_type not in {"siglip", "dinov2"}:
+            raise ValueError(f"Unsupported room_encoder: {room_encoder}")
+
+        siglip_model = resolve_siglip_model(siglip_model)
+        print(f"[PlacementHeatmap] Using SigLIP object/text model: {siglip_model}")
 
         # SigLIP vision encoder (shared for room spatial + object patches)
-        self.vision_encoder = SiglipVisionEncoder(siglip_model)
+        self.vision_encoder = SiglipVisionEncoder(
+            siglip_model,
+            image_size=object_image_size,
+        )
         siglip_dim = self.vision_encoder.feature_dim
 
         # SigLIP text encoder
         self.text_encoder = SiglipTextEncoder(siglip_model)
 
-        # Hidden dim for attention modules
-        hidden_dim = 256
+        if self.room_encoder_type == "dinov2":
+            dino_model = resolve_dinov2_model(dino_model)
+            print(f"[PlacementHeatmap] Using DINOv2 room model: {dino_model}")
+            self.room_encoder = DinoVisionEncoder(
+                dino_model,
+                image_size=room_image_size or DINO_IMAGE_SIZE,
+            )
+            room_dim = self.room_encoder.feature_dim
+        else:
+            self.room_encoder = None
+            room_dim = siglip_dim
 
         # Object-Text fusion (sequence concat, 不压缩)
         self.obj_text_fusion = ObjTextFusion(siglip_dim, output_dim=hidden_dim)
 
         # Spatial refinement (self-attention on room features)
         self.spatial_refinement = SpatialRefinement(
-            in_channels=siglip_dim,
+            in_channels=room_dim,
             hidden_dim=hidden_dim,
             num_heads=8,
         )
@@ -487,11 +666,19 @@ class PlacementHeatmap(nn.Module):
         # Cross-attention heatmap head
         # spatial_features 来自 SpatialRefinement (siglip_dim), KV 来自 ObjTextFusion (hidden_dim)
         self.heatmap_head = CrossAttentionHeatmap(
-            feature_dim=siglip_dim,
+            feature_dim=room_dim,
             kv_dim=hidden_dim,
             hidden_dim=hidden_dim,
             num_heads=8,
         )
+
+    def preprocess_room_image(self, image):
+        if self.room_encoder_type == "dinov2":
+            return self.room_encoder.preprocess(image)
+        return self.vision_encoder.preprocess(image)
+
+    def preprocess_object_image(self, image):
+        return self.vision_encoder.preprocess(image)
 
     def forward_tensor(
         self,
@@ -520,8 +707,11 @@ class PlacementHeatmap(nn.Module):
         """Generate placement heatmap from preprocessed tensor inputs."""
         B = room_image.size(0)
 
-        # Stage 1: SigLIP encode room top view -> spatial features
-        spatial_features = self.vision_encoder.encode_spatial(room_image)  # [B, g, g, C]
+        # Stage 1: encode room top view -> spatial features
+        if self.room_encoder_type == "dinov2":
+            spatial_features = self.room_encoder.encode_spatial(room_image)  # [B, g, g, C]
+        else:
+            spatial_features = self.vision_encoder.encode_spatial(room_image)  # [B, g, g, C]
 
         # Stage 2: Spatial refinement (self-attention)
         spatial_features = self.spatial_refinement(spatial_features)
@@ -530,7 +720,7 @@ class PlacementHeatmap(nn.Module):
         if object_image is not None:
             obj_patches = self.vision_encoder.encode_patches(object_image)  # [B, 729, C]
         else:
-            device = next(self.vision_encoder.model.parameters()).device
+            device = spatial_features.device
             obj_patches = torch.zeros(B, self.vision_encoder.num_patches,
                                       self.vision_encoder.feature_dim, device=device)
 
@@ -551,4 +741,3 @@ class PlacementHeatmap(nn.Module):
         ).squeeze(1)  # [B, H, W]
 
         return heatmap
-

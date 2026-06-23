@@ -56,10 +56,10 @@ def test_model_forward():
         # 前向传播
         print("\n[3/4] 执行前向传播...")
         model.eval()
-        room_tensor = model.vision_encoder.preprocess(
+        room_tensor = model.preprocess_room_image(
             Image.open(room_image_path).convert("RGB")
         ).unsqueeze(0).to(device)
-        object_tensor = model.vision_encoder.preprocess(
+        object_tensor = model.preprocess_object_image(
             Image.open(object_image_path).convert("RGB")
         ).unsqueeze(0).to(device)
         with torch.no_grad():
@@ -120,10 +120,10 @@ def test_batch_forward():
         print("逐个处理样本...")
         heatmaps = []
         for room_path, object_path, desc in zip(room_paths, object_paths, descs):
-            room_tensor = model.vision_encoder.preprocess(
+            room_tensor = model.preprocess_room_image(
                 Image.open(room_path).convert("RGB")
             ).unsqueeze(0).to(device)
-            object_tensor = model.vision_encoder.preprocess(
+            object_tensor = model.preprocess_object_image(
                 Image.open(object_path).convert("RGB")
             ).unsqueeze(0).to(device)
             with torch.no_grad():

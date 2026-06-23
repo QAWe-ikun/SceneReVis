@@ -12,6 +12,7 @@ export PTH_ASSETS_METADATA="${PROJECT_ROOT}/metadata/model_info_3dfuture_assets.
 export PTH_ASSETS_METADATA_SCALED="${PROJECT_ROOT}/metadata/model_info_3dfuture_assets_scaled.json"
 export PTH_ASSETS_EMBED="${PROJECT_ROOT}/metadata/model_info_3dfuture_assets_embeds.pickle"
 export SCENEREVIS_SIGLIP_MODEL="${PROJECT_ROOT}/ckpt/google/siglip-so400m-patch14-384"
+export SCENEREVIS_DINOV2_MODEL="${PROJECT_ROOT}/ckpt/facebook/dinov2-base"
 
 echo "✓ Environment variables set:"
 echo "  PTH_3DFUTURE_ASSETS: $PTH_3DFUTURE_ASSETS"
@@ -19,6 +20,7 @@ echo "  PTH_ASSETS_METADATA: $PTH_ASSETS_METADATA"
 echo "  PTH_ASSETS_METADATA_SCALED: $PTH_ASSETS_METADATA_SCALED"
 echo "  PTH_ASSETS_EMBED: $PTH_ASSETS_EMBED"
 echo "  SCENEREVIS_SIGLIP_MODEL: $SCENEREVIS_SIGLIP_MODEL"
+echo "  SCENEREVIS_DINOV2_MODEL: $SCENEREVIS_DINOV2_MODEL"
 echo ""
 echo "Verifying file existence..."
 
@@ -50,6 +52,12 @@ if [ -d "$SCENEREVIS_SIGLIP_MODEL" ]; then
     echo "  ✓ SigLIP model directory exists"
 else
     echo "  ✗ SigLIP model directory does not exist: $SCENEREVIS_SIGLIP_MODEL"
+fi
+
+if [ -d "$SCENEREVIS_DINOV2_MODEL" ]; then
+    echo "  DINOv2 model directory exists"
+else
+    echo "  DINOv2 model directory does not exist: $SCENEREVIS_DINOV2_MODEL"
 fi
 
 echo ""

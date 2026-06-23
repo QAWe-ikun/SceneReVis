@@ -860,8 +860,8 @@ def smart_truncate_conversation_history(
     current_user_message: str,
     current_image_path: str,
     engine,
-    max_model_len: int = 40960,
-    max_tokens: int = 16384,
+    max_model_len: int = 8192,
+    max_tokens: int = 1024,
     system_prompt: str = None
 ) -> list:
     """
@@ -2052,8 +2052,8 @@ def iterative_scene_generation(initial_scene_path, user_prompt, engine, request_
             current_user_message=current_user_message,
             current_image_path=current_image_path,
             engine=engine,
-            max_model_len=40960,
-            max_tokens=request_config.max_tokens if request_config.max_tokens else 16384
+            max_model_len=8192,
+            max_tokens=request_config.max_tokens if request_config.max_tokens else 1024
         )
         
         # If there is conversation history, add to message list
@@ -2598,8 +2598,8 @@ def batch_iterative_scene_generation_parallel(prompts: List[str], engine, reques
                 current_user_message=current_user_message,
                 current_image_path=ctx["current_image_path"],
                 engine=engine,
-                max_model_len=40960,
-                max_tokens=request_config.max_tokens if request_config.max_tokens else 16384
+                max_model_len=8192,
+                max_tokens=request_config.max_tokens if request_config.max_tokens else 1024
             )
             
             for hist_user_msg, hist_assistant_msg in conv_history:
@@ -3577,11 +3577,11 @@ Format template:
         
         engine = VllmEngine(
             model, 
-            max_model_len=40960, 
+            max_model_len=8192, 
             model_type="qwen2_5_vl", 
             seed=42,
             tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=0.9,
+            gpu_memory_utilization=0.92,
             template=template
         )
     else:
@@ -3592,7 +3592,7 @@ Format template:
         engine = PtEngine.from_model_template(model, template, max_batch_size=64)
 
     # temperature=0 + seed ensures deterministic output
-    request_config = RequestConfig(max_tokens=16384, temperature=0, seed=42)
+    request_config = RequestConfig(max_tokens=1024, temperature=0, seed=42)
     
     # Batch mode - execute full iterative scene generation for multiple prompts
     if args.batch_mode:

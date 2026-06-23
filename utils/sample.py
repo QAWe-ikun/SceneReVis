@@ -32,8 +32,8 @@ class AssetRetrievalModule(nn.Module):
 		# config = SiglipTextConfig.from_pretrained("google/siglip-so400m-patch14-384")
 		# config.max_position_embeddings = 64
 		# self.siglip_model = SiglipTextModel.from_pretrained("google/siglip-so400m-patch14-384", config=config)
-		self.siglip_model = SiglipTextModel.from_pretrained("google/siglip-so400m-patch14-384")
-		self.siglip_tokenizer = AutoTokenizer.from_pretrained("google/siglip-so400m-patch14-384")
+		self.siglip_model = SiglipTextModel.from_pretrained("/mnt/e/project/SceneReVis/ckpt/google/siglip-so400m-patch14-384")
+		self.siglip_tokenizer = AutoTokenizer.from_pretrained("/mnt/e/project/SceneReVis/ckpt/google/siglip-so400m-patch14-384")
 		
 		with open(os.getenv("PTH_ASSETS_EMBED"), 'rb') as fp: 
 			model_info_martin_embeds = pickle.load(fp)

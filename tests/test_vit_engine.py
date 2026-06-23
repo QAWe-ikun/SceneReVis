@@ -45,8 +45,8 @@ def test_vit_pipeline():
     create_fake_top_view(fake_img)
 
     image = Image.open(fake_img).convert("RGB")
-    room_tensor = model.vision_encoder.preprocess(image).unsqueeze(0).to(device)
-    object_tensor = model.vision_encoder.preprocess(image).unsqueeze(0).to(device)
+    room_tensor = model.preprocess_room_image(image).unsqueeze(0).to(device)
+    object_tensor = model.preprocess_object_image(image).unsqueeze(0).to(device)
     print(f"Room tensor shape: {room_tensor.shape}")
 
     # Stage 3: Full forward pass
