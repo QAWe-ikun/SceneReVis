@@ -1,9 +1,8 @@
-"""
-SceneReVis 热力图放置模型训练脚本
-
-训练数据格式 (由 generate_data.py 生成):
+﻿"""
+SceneReVis 鐑姏鍥炬斁缃ā鍨嬭缁冭剼鏈?
+璁粌鏁版嵁鏍煎紡 (鐢?generate_data.py 鐢熸垚):
   {data_dir}/{split}/{split}.json
-  每个样本:
+  姣忎釜鏍锋湰:
     {
       "sample_id": "obj_xxx",
       "scene_dir": "train/scene_001",
@@ -14,12 +13,13 @@ SceneReVis 热力图放置模型训练脚本
       "split": "train"
     }
 
-用法:
+鐢ㄦ硶:
   python train_heatmap.py --data_dir /path/to/heatmap_data --epochs 100 --batch_size 8
 """
 import os
 import sys
 import json
+import math
 import argparse
 import logging
 from collections import deque
@@ -32,13 +32,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 import numpy as np
 from PIL import Image
 import torchvision.transforms as T
 from tqdm import tqdm
 
-# 添加项目根目录到 path
+# 娣诲姞椤圭洰鏍圭洰褰曞埌 path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from utils.placement_heatmap import (
@@ -57,7 +57,7 @@ from utils.placement_heatmap import (
 # ============================================================================
 
 class HeatmapDataset(Dataset):
-    """热力图训练数据集"""
+    """鐑姏鍥捐缁冩暟鎹泦"""
 
     def __init__(
         self,
@@ -70,9 +70,8 @@ class HeatmapDataset(Dataset):
     ):
         """
         Args:
-            data_dir: 数据根目录
-            split: train/val/test
-            image_size: 图像分辨率 (应匹配 SigLIP 模型输入尺寸 384)
+            data_dir: 鏁版嵁鏍圭洰褰?            split: train/val/test
+            image_size: 鍥惧儚鍒嗚鲸鐜?(搴斿尮閰?SigLIP 妯″瀷杈撳叆灏哄 384)
         """
         self.data_dir = Path(data_dir)
         self.split = split
@@ -83,15 +82,14 @@ class HeatmapDataset(Dataset):
         )
         self.object_image_size = object_image_size or image_size
 
-        # 加载元数据
         json_path = self.data_dir / split / f"{split}.json"
         with open(json_path, 'r', encoding='utf-8') as f:
             self.samples = json.load(f)
 
         logging.info(f"Loaded {len(self.samples)} samples from {json_path}")
 
-        # 图像预处理 (SigLIP 标准)
-        # 注意：图像会被 resize 到 image_size (默认 384，匹配 SigLIP 输入)
+        # 鍥惧儚棰勫鐞?(SigLIP 鏍囧噯)
+        # 娉ㄦ剰锛氬浘鍍忎細琚?resize 鍒?image_size (榛樿 384锛屽尮閰?SigLIP 杈撳叆)
         if self.room_encoder == "dinov2":
             self.room_transform = build_dino_image_transform(self.room_image_size)
         else:
@@ -105,22 +103,21 @@ class HeatmapDataset(Dataset):
         sample = self.samples[idx]
         scene_dir = self.data_dir / sample["scene_dir"]
 
-        # 加载房间俯视图
         room_path = scene_dir / sample["plane_image_path"]
         room_img = Image.open(room_path).convert("RGB")
         room_tensor = self.room_transform(room_img)
 
-        # 加载物体参考图
+        # 鍔犺浇鐗╀綋鍙傝€冨浘
         object_path = scene_dir / sample["object_image_path"]
         object_img = Image.open(object_path).convert("RGB")
         object_tensor = self.object_transform(object_img)
 
-        # 加载 GT 热力图 (mask)
+        # 鍔犺浇 GT 鐑姏鍥?(mask)
         mask_path = scene_dir / sample["mask_path"]
         mask_img = Image.open(mask_path).convert("L")
-        mask_tensor = T.functional.to_tensor(mask_img)  # [1, H, W], 值域 [0, 1]
+        mask_tensor = T.functional.to_tensor(mask_img)  # [1, H, W], 鍊煎煙 [0, 1]
 
-        # 文本描述
+        # 鏂囨湰鎻忚堪
         object_desc = sample["object_desc"]
 
         result = {
@@ -131,7 +128,7 @@ class HeatmapDataset(Dataset):
             "sample_id": sample["sample_id"],
         }
 
-        # 透传新增的可选元数据字段 (scene_name, removed_object, text_source)
+        # 閫忎紶鏂板鐨勫彲閫夊厓鏁版嵁瀛楁 (scene_name, removed_object, text_source)
         for key in ("scene_name", "removed_object", "text_source"):
             if key in sample:
                 result[key] = sample[key]
@@ -180,6 +177,36 @@ def peak_distance(pred_heatmap: torch.Tensor, target_heatmap: torch.Tensor) -> f
     return ((pred_y - gt_y) ** 2 + (pred_x - gt_x) ** 2) ** 0.5
 
 
+def build_step_warmup_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr: float,
+) -> LambdaLR:
+    """Build a per-optimizer-step warmup + cosine scheduler."""
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+    base_lrs = [group["lr"] for group in optimizer.param_groups]
+
+    def lr_factor_for(base_lr: float):
+        min_factor = min_lr / base_lr if base_lr > 0 else 0.0
+
+        def lr_lambda(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                progress = step / warmup_steps
+                return min_factor + (1.0 - min_factor) * progress
+
+            decay_steps = max(1, total_steps - warmup_steps)
+            progress = min(1.0, (step - warmup_steps) / decay_steps)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_factor + (1.0 - min_factor) * cosine
+
+        return lr_lambda
+
+    return LambdaLR(optimizer, lr_lambda=[lr_factor_for(lr) for lr in base_lrs])
+
+
 # ============================================================================
 # Training Loop
 # ============================================================================
@@ -195,10 +222,10 @@ def train_one_epoch(
     peak_tolerance: float = 32.0,
     peak_window: int = 200,
 ) -> tuple[float, float]:
-    """训练一个 epoch
+    """璁粌涓€涓?epoch
 
     Args:
-        batch_scheduler: 如果提供, 每个 batch 后步进学习率 (test_lr 模式)
+        batch_scheduler: optional scheduler stepped after every optimizer step.
     """
     model.train()
     total_loss = 0.0
@@ -219,8 +246,7 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
-        # 前向传播 (使用 tensor 接口)
-        # 当前文本编码器不支持批量，逐样本处理
+        # Forward one sample at a time because the text encoder is not batched here.
         batch_size = room_images.size(0)
         batch_loss = 0.0
 
@@ -236,7 +262,7 @@ def train_one_epoch(
                 object_image=obj_img,
             )  # [1, H, W]
 
-            # 计算损失
+            # 璁＄畻鎹熷け
             mask_resized = F.interpolate(
                 mask,
                 size=pred_heatmap.shape[-2:],
@@ -247,7 +273,7 @@ def train_one_epoch(
             loss = heatmap_bce_loss(pred_heatmap, mask_resized, pos_weight=pos_weight)
             batch_loss += loss
 
-            # 统计峰值准确率
+            # 缁熻宄板€煎噯纭巼
             with torch.no_grad():
                 dist = peak_distance(pred_heatmap[0], mask_resized[0])
                 is_correct = dist < peak_tolerance
@@ -261,7 +287,7 @@ def train_one_epoch(
         batch_loss.backward()
         optimizer.step()
 
-        # test_lr 模式: 每个 batch 后步进学习率
+        # Step batch-level schedulers after the optimizer update.
         if batch_scheduler is not None:
             batch_scheduler.step()
 
@@ -299,10 +325,9 @@ def validate(
     pos_weight: float = 10.0,
     peak_tolerance: float = 32.0,
 ) -> tuple[float, float]:
-    """验证，返回 (loss, peak_accuracy)
+    """楠岃瘉锛岃繑鍥?(loss, peak_accuracy)
 
-    peak_accuracy: 预测峰值位置与 GT 峰值位置的距离 < 32 像素的比例
-    """
+    peak_accuracy: 棰勬祴宄板€间綅缃笌 GT 宄板€间綅缃殑璺濈 < 32 鍍忕礌鐨勬瘮渚?    """
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -342,7 +367,7 @@ def validate(
             loss = heatmap_bce_loss(pred_heatmap, mask_resized, pos_weight=pos_weight)
             batch_loss += loss
 
-            # 计算峰值准确率
+            # 璁＄畻宄板€煎噯纭巼
             dist = peak_distance(pred_heatmap[0], mask_resized[0])
             if dist < peak_tolerance:
                 peak_correct += 1
@@ -365,26 +390,31 @@ def validate(
 
 def main():
     parser = argparse.ArgumentParser(description="Train heatmap placement model")
-    parser.add_argument("--data_dir", type=str, required=True, help="数据目录")
-    parser.add_argument("--output_dir", type=str, default="checkpoints/heatmap", help="输出目录")
-    parser.add_argument("--epochs", type=int, default=100, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=4, help="批量大小")
-    parser.add_argument("--lr", type=float, default=1e-4, help="学习率")
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="权重衰减")
-    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
-    parser.add_argument("--image_size", type=int, default=384, help="图像分辨率 (应匹配 SigLIP 输入)")
-    parser.add_argument("--resume", type=str, default=None, help="恢复训练的检查点路径")
-    parser.add_argument("--log_interval", type=int, default=10, help="日志间隔")
+    parser.add_argument("--data_dir", type=str, required=True, help="Data directory")
+    parser.add_argument("--output_dir", type=str, default="checkpoints/heatmap", help="Output directory")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker count")
+    parser.add_argument("--image_size", type=int, default=384, help="Image resolution for SigLIP inputs")
+    parser.add_argument("--resume", type=str, default=None, help="Checkpoint path to resume from")
+    parser.add_argument("--log_interval", type=int, default=10, help="Logging interval")
     parser.add_argument("--pos_weight", type=float, default=10.0,
                        help="GT heatmap positive-region BCE weight")
     parser.add_argument("--peak_tolerance", type=float, default=32.0,
                        help="Peak accuracy tolerance in 256x256 heatmap pixels")
     parser.add_argument("--peak_window", type=int, default=200,
                        help="Recent sample window for train progress peak/distance diagnostics")
+    parser.add_argument("--lr_scheduler", type=str, default="step_cosine",
+                       choices=["step_cosine", "epoch_cosine"],
+                       help="Learning-rate schedule for regular training")
+    parser.add_argument("--warmup_steps", type=int, default=1000,
+                       help="Warmup optimizer steps for step_cosine")
+    parser.add_argument("--min_lr", type=float, default=1e-6,
+                       help="Minimum learning rate for cosine schedules")
     parser.add_argument("--early_stop_patience", type=int, default=0,
                        help="Stop after N epochs without val-loss improvement; 0 disables")
-    parser.add_argument("--test_lr", action="store_true",
-                       help="LR 测试模式: 1 epoch 内 cosine 衰减, 快速观察不同 lr 效果")
     parser.add_argument("--room_encoder", type=str, default="siglip", choices=["siglip", "dinov2"],
                        help="Room/top-view encoder: siglip or dinov2")
     parser.add_argument("--dino_model", type=str, default=None,
@@ -395,9 +425,17 @@ def main():
                        help="Object image input size; defaults to image_size")
     parser.add_argument("--hidden_dim", type=int, default=256,
                        help="Trainable attention hidden dimension")
+    parser.add_argument("--decoder_layers", type=int, default=3,
+                       help="Number of SAM-style two-way decoder layers")
+    parser.add_argument("--num_heads", type=int, default=8,
+                       help="Number of attention heads in trainable decoder")
+    parser.add_argument("--mlp_ratio", type=float, default=4.0,
+                       help="MLP expansion ratio in trainable decoder blocks")
+    parser.add_argument("--decoder_dropout", type=float, default=0.0,
+                       help="Dropout used inside trainable decoder blocks")
     args = parser.parse_args()
 
-    # 设置日志
+    # 璁剧疆鏃ュ織
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"train_heatmap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -412,15 +450,15 @@ def main():
     )
     logging.info(f"Training arguments: {args}")
 
-    # 设备
+    # 璁惧
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
-    # 创建输出目录
+    # 鍒涘缓杈撳嚭鐩綍
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 数据集
+    # Dataset
     room_image_size = args.room_image_size or (
         DINO_IMAGE_SIZE if args.room_encoder == "dinov2" else args.image_size
     )
@@ -459,7 +497,7 @@ def main():
         collate_fn=heatmap_collate_fn,
     )
 
-    # 模型
+    # 妯″瀷
     model = PlacementHeatmap(
         heatmap_res=256,
         room_encoder=args.room_encoder,
@@ -467,27 +505,48 @@ def main():
         hidden_dim=args.hidden_dim,
         room_image_size=room_image_size,
         object_image_size=object_image_size,
+        decoder_layers=args.decoder_layers,
+        num_heads=args.num_heads,
+        mlp_ratio=args.mlp_ratio,
+        decoder_dropout=args.decoder_dropout,
     ).to(device)
     logging.info(f"Model initialized: {sum(p.numel() for p in model.parameters()):,} parameters")
 
-    # 优化器
+    # Optimizer
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
 
-    # 学习率调度器
-    # test_lr 模式: 1 epoch 内 cosine 衰减, T_max = 总 batch 数
-    if args.test_lr:
-        total_batches = len(train_loader)
-        scheduler = CosineAnnealingLR(optimizer, T_max=total_batches, eta_min=1e-6)
-        args.epochs = 1
-        logging.info(f"LR 测试模式: 1 epoch, {total_batches} batches, lr {args.lr} -> 1e-6")
+    # Learning-rate scheduler
+    if args.lr_scheduler == "step_cosine":
+        total_steps = len(train_loader) * args.epochs
+        scheduler = build_step_warmup_cosine_scheduler(
+            optimizer=optimizer,
+            total_steps=total_steps,
+            warmup_steps=args.warmup_steps,
+            min_lr=args.min_lr,
+        )
+        scheduler_step_unit = "batch"
+        logging.info(
+            "LR scheduler: step_cosine, total_steps=%d, warmup_steps=%d, lr=%s -> %s",
+            total_steps,
+            min(args.warmup_steps, max(0, total_steps - 1)),
+            args.lr,
+            args.min_lr,
+        )
     else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+        scheduler_step_unit = "epoch"
+        logging.info(
+            "LR scheduler: epoch_cosine, epochs=%d, lr=%s -> %s",
+            args.epochs,
+            args.lr,
+            args.min_lr,
+        )
 
-    # 恢复训练
+    # 鎭㈠璁粌
     start_epoch = 0
     best_val_loss = float('inf')
     best_peak_acc = 0.0
@@ -514,15 +573,14 @@ def main():
             f"best_val_loss={best_val_loss:.4f}, best_peak_acc={best_peak_acc:.2%}"
         )
 
-    # 训练循环
+    # 璁粌寰幆
     for epoch in range(start_epoch, args.epochs):
         logging.info(f"\n{'='*60}")
         logging.info(f"Epoch {epoch+1}/{args.epochs}")
         logging.info(f"{'='*60}")
 
-        # 训练
-        # test_lr 模式: 传入 scheduler, 每个 batch 后步进学习率
-        batch_scheduler = scheduler if args.test_lr else None
+        # 璁粌
+        batch_scheduler = scheduler if scheduler_step_unit == "batch" else None
         train_loss, train_peak_acc = train_one_epoch(
             model,
             train_loader,
@@ -536,7 +594,7 @@ def main():
         )
         logging.info(f"Train Loss: {train_loss:.4f}, Peak Acc: {train_peak_acc:.2%}")
 
-        # 验证
+        # 楠岃瘉
         val_loss, peak_acc = validate(
             model,
             val_loader,
@@ -547,13 +605,13 @@ def main():
         )
         logging.info(f"Val Loss: {val_loss:.4f}, Peak Acc: {peak_acc:.2%}")
 
-        # 更新学习率 (test_lr 模式已在 batch 内步进, 跳过 epoch 级调度)
-        if not args.test_lr:
+        # 鏇存柊瀛︿範鐜?
+        if scheduler_step_unit == "epoch":
             scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         logging.info(f"Learning Rate: {current_lr:.6f}")
 
-        # 保存检查点
+        # 淇濆瓨妫€鏌ョ偣
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": trainable_heatmap_state_dict(model),
@@ -564,13 +622,13 @@ def main():
             "args": vars(args),
         }
 
-        # 保存最佳检查点
+        # 淇濆瓨鏈€浣虫鏌ョ偣
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_without_improvement = 0
             checkpoint["best_val_loss"] = best_val_loss
             torch.save(checkpoint, output_dir / "best.pth")
-            logging.info(f"✓ New best model saved (val_loss={val_loss:.4f})")
+            logging.info(f"鉁?New best model saved (val_loss={val_loss:.4f})")
         else:
             epochs_without_improvement += 1
 
@@ -578,15 +636,15 @@ def main():
             best_peak_acc = peak_acc
             checkpoint["best_peak_acc"] = best_peak_acc
             torch.save(checkpoint, output_dir / "best_peak.pth")
-            logging.info(f"✓ New best peak model saved (peak_acc={peak_acc:.2%})")
+            logging.info(f"鉁?New best peak model saved (peak_acc={peak_acc:.2%})")
 
         checkpoint["best_val_loss"] = best_val_loss
         checkpoint["best_peak_acc"] = best_peak_acc
 
-        # 保存最新检查点
+        # 淇濆瓨鏈€鏂版鏌ョ偣
         torch.save(checkpoint, output_dir / "latest.pth")
 
-        # 定期保存
+        # 瀹氭湡淇濆瓨
         if (epoch + 1) % 10 == 0:
             torch.save(checkpoint, output_dir / f"epoch_{epoch+1}.pth")
 

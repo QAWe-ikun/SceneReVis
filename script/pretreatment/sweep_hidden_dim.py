@@ -71,10 +71,24 @@ def build_train_command(args, hidden_dim: int, output_dir: Path) -> list[str]:
         str(args.pos_weight),
         "--peak_tolerance",
         str(args.peak_tolerance),
+        "--lr_scheduler",
+        args.lr_scheduler,
+        "--warmup_steps",
+        str(args.warmup_steps),
+        "--min_lr",
+        str(args.min_lr),
         "--room_encoder",
         args.room_encoder,
         "--hidden_dim",
         str(hidden_dim),
+        "--decoder_layers",
+        str(args.decoder_layers),
+        "--num_heads",
+        str(args.num_heads),
+        "--mlp_ratio",
+        str(args.mlp_ratio),
+        "--decoder_dropout",
+        str(args.decoder_dropout),
     ]
 
     add_if_present(cmd, "--dino_model", args.dino_model)
@@ -85,9 +99,6 @@ def build_train_command(args, hidden_dim: int, output_dir: Path) -> list[str]:
     latest = output_dir / "latest.pth"
     if args.resume_existing and latest.exists():
         cmd.extend(["--resume", str(latest)])
-
-    if args.test_lr:
-        cmd.append("--test_lr")
 
     return cmd
 
@@ -165,8 +176,14 @@ def main() -> None:
     parser.add_argument("--object_image_size", type=int, default=None)
     parser.add_argument("--pos_weight", type=float, default=10.0)
     parser.add_argument("--peak_tolerance", type=float, default=32.0)
+    parser.add_argument("--lr_scheduler", default="step_cosine", choices=["step_cosine", "epoch_cosine"])
+    parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--min_lr", type=float, default=1e-6)
+    parser.add_argument("--decoder_layers", type=int, default=3)
+    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--decoder_dropout", type=float, default=0.0)
     parser.add_argument("--early_stop_patience", type=int, default=0)
-    parser.add_argument("--test_lr", action="store_true")
     parser.add_argument("--resume_existing", action="store_true",
                         help="Resume from each output_dir/latest.pth when present")
     parser.add_argument("--force", action="store_true",

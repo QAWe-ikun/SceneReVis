@@ -748,6 +748,14 @@ def main():
                         help="Object image input size; defaults to image_size")
     parser.add_argument("--hidden_dim", type=int, default=None,
                         help="Trainable attention hidden dimension used by the checkpoint")
+    parser.add_argument("--decoder_layers", type=int, default=None,
+                        help="Number of SAM-style two-way decoder layers used by the checkpoint")
+    parser.add_argument("--num_heads", type=int, default=None,
+                        help="Number of attention heads used by the checkpoint")
+    parser.add_argument("--mlp_ratio", type=float, default=None,
+                        help="MLP expansion ratio used by the checkpoint")
+    parser.add_argument("--decoder_dropout", type=float, default=None,
+                        help="Decoder dropout used by the checkpoint")
     parser.add_argument("--split", type=str, default="val", help="Dataset split (train/val/test)")
     parser.add_argument("--qwen3-vl-model", type=str, default="/mnt/f/models/qwen3_vl",
                         help="Qwen3-VL model path for coordinate baseline")
@@ -800,6 +808,12 @@ def main():
     room_encoder = args.room_encoder or checkpoint_args.get("room_encoder", "siglip")
     dino_model = args.dino_model or checkpoint_args.get("dino_model")
     hidden_dim = args.hidden_dim or checkpoint_args.get("hidden_dim", 256)
+    decoder_layers = args.decoder_layers or checkpoint_args.get("decoder_layers", 3)
+    num_heads = args.num_heads or checkpoint_args.get("num_heads", 8)
+    mlp_ratio = args.mlp_ratio or checkpoint_args.get("mlp_ratio", 4.0)
+    decoder_dropout = args.decoder_dropout
+    if decoder_dropout is None:
+        decoder_dropout = checkpoint_args.get("decoder_dropout", 0.0)
     room_image_size = args.room_image_size or checkpoint_args.get("room_image_size")
     object_image_size = (
         args.object_image_size
@@ -809,10 +823,15 @@ def main():
     )
     logging.info(
         "Heatmap model config: room_encoder=%s, dino_model=%s, hidden_dim=%s, "
+        "decoder_layers=%s, num_heads=%s, mlp_ratio=%s, decoder_dropout=%s, "
         "room_image_size=%s, object_image_size=%s",
         room_encoder,
         dino_model,
         hidden_dim,
+        decoder_layers,
+        num_heads,
+        mlp_ratio,
+        decoder_dropout,
         room_image_size,
         object_image_size,
     )
@@ -825,6 +844,10 @@ def main():
         hidden_dim=hidden_dim,
         room_image_size=room_image_size,
         object_image_size=object_image_size,
+        decoder_layers=decoder_layers,
+        num_heads=num_heads,
+        mlp_ratio=mlp_ratio,
+        decoder_dropout=decoder_dropout,
     ).to(device)
     model = load_checkpoint(model, args.checkpoint, device)
 

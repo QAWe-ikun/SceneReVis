@@ -591,6 +591,245 @@ class ObjTextFusion(nn.Module):
 
 
 # ============================================================================
+# SAM-style Two-Way Decoder
+# ============================================================================
+
+class LayerNorm2d(nn.Module):
+    """LayerNorm over the channel axis for NCHW feature maps."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=1, keepdim=True)
+        var = (x - mean).pow(2).mean(dim=1, keepdim=True)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        return self.weight[:, None, None] * x + self.bias[:, None, None]
+
+
+class TokenMLP(nn.Module):
+    """Transformer feed-forward block for token sequences."""
+
+    def __init__(self, hidden_dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        mlp_dim = int(hidden_dim * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def mask_prompt_tokens(
+    tokens: torch.Tensor,
+    padding_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if padding_mask is None:
+        return tokens
+    return tokens.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+
+
+class PromptProjector(nn.Module):
+    """Project object patch tokens and text tokens into decoder prompt tokens."""
+
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        obj_patches: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = obj_patches.size(0)
+        N_obj = obj_patches.size(1)
+
+        if text_tokens.size(0) == 1 and B > 1:
+            text_tokens = text_tokens.expand(B, -1, -1)
+            text_mask = text_mask.expand(B, -1)
+
+        prompt_tokens = torch.cat([obj_patches, text_tokens], dim=1)
+        obj_mask = torch.ones(B, N_obj, dtype=torch.bool, device=obj_patches.device)
+        padding_mask = ~torch.cat([obj_mask, text_mask], dim=1)
+
+        prompt_tokens = self.norm(self.proj(prompt_tokens))
+        prompt_tokens = mask_prompt_tokens(prompt_tokens, padding_mask)
+        return prompt_tokens, padding_mask
+
+
+class TwoWayDecoderBlock(nn.Module):
+    """SAM-style prompt/image two-way attention block."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.prompt_self_attn = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_prompt_self = nn.LayerNorm(hidden_dim)
+
+        self.prompt_to_room_attn = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_prompt_cross = nn.LayerNorm(hidden_dim)
+
+        self.prompt_mlp = TokenMLP(hidden_dim, mlp_ratio=mlp_ratio, dropout=dropout)
+        self.norm_prompt_mlp = nn.LayerNorm(hidden_dim)
+
+        self.room_to_prompt_attn = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_room_cross = nn.LayerNorm(hidden_dim)
+
+        self.room_mlp = TokenMLP(hidden_dim, mlp_ratio=mlp_ratio, dropout=dropout)
+        self.norm_room_mlp = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        room_tokens: torch.Tensor,
+        prompt_tokens: torch.Tensor,
+        prompt_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        prompt_tokens = mask_prompt_tokens(prompt_tokens, prompt_padding_mask)
+
+        prompt_delta, _ = self.prompt_self_attn(
+            query=prompt_tokens,
+            key=prompt_tokens,
+            value=prompt_tokens,
+            key_padding_mask=prompt_padding_mask,
+        )
+        prompt_tokens = self.norm_prompt_self(prompt_tokens + prompt_delta)
+        prompt_tokens = mask_prompt_tokens(prompt_tokens, prompt_padding_mask)
+
+        prompt_delta, _ = self.prompt_to_room_attn(
+            query=prompt_tokens,
+            key=room_tokens,
+            value=room_tokens,
+        )
+        prompt_tokens = self.norm_prompt_cross(prompt_tokens + prompt_delta)
+        prompt_tokens = mask_prompt_tokens(prompt_tokens, prompt_padding_mask)
+
+        prompt_tokens = self.norm_prompt_mlp(prompt_tokens + self.prompt_mlp(prompt_tokens))
+        prompt_tokens = mask_prompt_tokens(prompt_tokens, prompt_padding_mask)
+
+        room_delta, _ = self.room_to_prompt_attn(
+            query=room_tokens,
+            key=prompt_tokens,
+            value=prompt_tokens,
+            key_padding_mask=prompt_padding_mask,
+        )
+        room_tokens = self.norm_room_cross(room_tokens + room_delta)
+        room_tokens = self.norm_room_mlp(room_tokens + self.room_mlp(room_tokens))
+
+        return room_tokens, prompt_tokens
+
+
+class TwoWayHeatmapDecoder(nn.Module):
+    """Two-way prompt/dense decoder with a SAM-style learned upscaling head."""
+
+    def __init__(
+        self,
+        room_dim: int,
+        prompt_dim: int,
+        hidden_dim: int = 256,
+        num_heads: int = 8,
+        num_layers: int = 3,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+
+        self.room_proj = nn.Sequential(
+            nn.Linear(room_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.prompt_projector = PromptProjector(prompt_dim, hidden_dim)
+        self.layers = nn.ModuleList([
+            TwoWayDecoderBlock(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+        up_dim1 = max(hidden_dim // 4, 16)
+        up_dim2 = max(hidden_dim // 8, 8)
+        head_dim = max(hidden_dim // 16, 8)
+        self.output_upscaling = nn.Sequential(
+            nn.ConvTranspose2d(hidden_dim, up_dim1, kernel_size=2, stride=2),
+            LayerNorm2d(up_dim1),
+            nn.GELU(),
+            nn.ConvTranspose2d(up_dim1, up_dim2, kernel_size=2, stride=2),
+            nn.GELU(),
+        )
+        self.heatmap_head = nn.Sequential(
+            nn.Conv2d(up_dim2, head_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(head_dim, 1, kernel_size=1),
+        )
+        self.logit_bias = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        room_features: torch.Tensor,
+        obj_patches: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        B, H, W, _ = room_features.shape
+        room_tokens = self.room_proj(room_features).reshape(B, H * W, -1)
+        prompt_tokens, prompt_padding_mask = self.prompt_projector(
+            obj_patches,
+            text_tokens,
+            text_mask,
+        )
+
+        for layer in self.layers:
+            room_tokens, prompt_tokens = layer(
+                room_tokens,
+                prompt_tokens,
+                prompt_padding_mask,
+            )
+
+        room_map = room_tokens.transpose(1, 2).reshape(B, -1, H, W)
+        upscaled = self.output_upscaling(room_map)
+        logits = self.heatmap_head(upscaled).squeeze(1)
+        return logits + self.logit_bias
+
+
+# ============================================================================
 # Full PlacementHeatmap Module (pure SigLIP)
 # ============================================================================
 
@@ -620,6 +859,10 @@ class PlacementHeatmap(nn.Module):
         hidden_dim: int = 256,
         room_image_size: Optional[int] = None,
         object_image_size: Optional[int] = None,
+        decoder_layers: int = 3,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        decoder_dropout: float = 0.0,
     ):
         super().__init__()
         self.heatmap_res = heatmap_res
@@ -654,24 +897,17 @@ class PlacementHeatmap(nn.Module):
             room_dim = siglip_dim
 
         # Object-Text fusion (sequence concat, 不压缩)
-        self.obj_text_fusion = ObjTextFusion(siglip_dim, output_dim=hidden_dim)
-
-        # Spatial refinement (self-attention on room features)
-        self.spatial_refinement = SpatialRefinement(
-            in_channels=room_dim,
+        self.heatmap_decoder = TwoWayHeatmapDecoder(
+            room_dim=room_dim,
+            prompt_dim=siglip_dim,
             hidden_dim=hidden_dim,
-            num_heads=8,
+            num_heads=num_heads,
+            num_layers=decoder_layers,
+            mlp_ratio=mlp_ratio,
+            dropout=decoder_dropout,
         )
 
-        # Cross-attention heatmap head
         # spatial_features 来自 SpatialRefinement (siglip_dim), KV 来自 ObjTextFusion (hidden_dim)
-        self.heatmap_head = CrossAttentionHeatmap(
-            feature_dim=room_dim,
-            kv_dim=hidden_dim,
-            hidden_dim=hidden_dim,
-            num_heads=8,
-        )
-
     def preprocess_room_image(self, image):
         if self.room_encoder_type == "dinov2":
             return self.room_encoder.preprocess(image)
@@ -713,10 +949,7 @@ class PlacementHeatmap(nn.Module):
         else:
             spatial_features = self.vision_encoder.encode_spatial(room_image)  # [B, g, g, C]
 
-        # Stage 2: Spatial refinement (self-attention)
-        spatial_features = self.spatial_refinement(spatial_features)
-
-        # Stage 3: SigLIP encode object image (patch sequence) + text (token sequence)
+        # Stage 2: SigLIP encode object image (patch sequence) + text (token sequence)
         if object_image is not None:
             obj_patches = self.vision_encoder.encode_patches(object_image)  # [B, 729, C]
         else:
@@ -726,18 +959,21 @@ class PlacementHeatmap(nn.Module):
 
         text_tokens, text_mask = self.text_encoder.encode(object_desc)  # [1, T, C], [1, T]
 
-        # Stage 4: Object-Text fusion -> KV sequence
-        kv_seq, kv_padding_mask = self.obj_text_fusion(obj_patches, text_tokens, text_mask)
+        # Stage 3: two-way prompt/dense decoding with learned upscaling.
+        logits = self.heatmap_decoder(
+            spatial_features,
+            obj_patches,
+            text_tokens,
+            text_mask,
+        )
 
-        # Stage 5: Cross-attention -> heatmap at ViT patch resolution
-        heatmap_low = self.heatmap_head(spatial_features, kv_seq, kv_padding_mask)  # [B, g, g]
+        if logits.shape[-2:] != (self.heatmap_res, self.heatmap_res):
+            logits = F.interpolate(
+                logits.unsqueeze(1),
+                size=(self.heatmap_res, self.heatmap_res),
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(1)
 
-        # Stage 6: Upsample to target heatmap resolution
-        heatmap = F.interpolate(
-            heatmap_low.unsqueeze(1),  # [B, 1, g, g]
-            size=(self.heatmap_res, self.heatmap_res),
-            mode='bilinear',
-            align_corners=False,
-        ).squeeze(1)  # [B, H, W]
-
+        heatmap = torch.sigmoid(logits)
         return heatmap
