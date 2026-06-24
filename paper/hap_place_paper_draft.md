@@ -130,7 +130,18 @@ p* = Phi_phys(LiftToReleasePose(x_0, S, o_t), S)
 
 where `Phi_phys` is implemented by minimum-height Isaac Sim drop-and-settle.
 
-This analysis does not require multi-modal labels or a claim that coordinate regression is non-differentiable. The point is instead representational: dense response supervision preserves local spatial structure, supports constrained maximization, and gives the physics layer a meaningful field to constrain. HSD baselines can still be optimized end-to-end, but they must introduce additional search, scoring, or refinement machinery to recover the spatial neighborhood information that SRS exposes natively.
+This analysis does not require multi-modal labels or a claim that coordinate regression is non-differentiable. The point is instead representational: dense response supervision preserves local spatial structure, supports constrained maximization, and gives the physics layer a meaningful field to constrain.
+
+To isolate this effect experimentally, we compare four output contracts:
+
+| Method | Learned mapping | Field access | Inference |
+|---|---|---|---|
+| HSD-Coord | `c -> (u, v)` | none | direct coordinate output |
+| HSD-F | `c -> (u, v)` after two-way fusion | none | learned query and direct coordinate output |
+| Implicit-Score | `(c, x) -> f_theta(x; c)` | query-only | fixed-grid score query and maximum |
+| HAP-Place | `c -> f_theta(.; c)` | explicit dense field | masked maximum |
+
+`HSD-F` is the strongest hard-decision baseline in our representation study: it shares the same DINOv2/SigLIP encoders and two-way fusion decoder as HAP-Place, but replaces the heatmap upsampling head with a learned placement query and an MLP coordinate head. `Implicit-Score` tests whether a coordinate-conditioned score function can match an explicit response surface when evaluated over the same spatial grid. HAP-Place differs by exposing the full response surface in a single forward pass.
 
 ## 4. Method
 
@@ -172,7 +183,30 @@ where high values indicate likely target object centers. The model contains:
 
 The two-way decoder lets target object and text tokens query the room layout while the room tokens are refined by object-conditioned context. This is important when the same object category appears multiple times, because the model must distinguish the exact local spatial configuration rather than only the category name.
 
-### 4.3 Heatmap Supervision
+### 4.3 Representation-Study Heads
+
+To separate the effect of the output representation from the effect of backbone capacity, we implement three controlled heads on top of the placement backbone.
+
+**HSD-Coord.** This baseline directly regresses the normalized image coordinate `(u, v)` from a pooled scene representation using an MLP. It represents a standard hard spatial decision model and is trained with coordinate regression loss.
+
+**HSD-F.** This baseline uses the same DINOv2 room encoder, SigLIP object/text encoders, and two-way fusion decoder as HAP-Place. After fusion, explicit 2D positional embeddings are added to the fused spatial tokens. A learned placement query then attends to these position-aware spatial tokens and the resulting token is passed to an MLP coordinate head:
+
+```
+z_q = Attn(q_place, F_fused, F_fused)
+(u_hat, v_hat) = MLP(z_q)
+```
+
+HSD-F therefore controls for the stronger fusion module and a strong coordinate readout. The only difference from HAP-Place is the final output contract: HSD-F collapses the fused spatial representation into a single coordinate token, while HAP-Place exposes a dense response surface.
+
+**Implicit-Score.** This baseline also shares the same encoders and two-way fusion decoder, but it predicts a scalar score for a queried coordinate:
+
+```
+s_hat = g_theta(F_fused, PE(u, v))
+```
+
+where `PE(u, v)` is a positional encoding of the queried coordinate. During training, each image contributes sampled query points around the ground-truth center and randomly sampled negatives, supervised by the same Gaussian target used for the heatmap. During inference, Implicit-Score evaluates a fixed grid of query points and selects the highest-scoring point. This tests whether a query-only implicit response function can match an explicitly materialized dense response surface.
+
+### 4.4 Heatmap Supervision
 
 For each training sample, the ground-truth object center is projected from 3D world coordinates to the top-down image plane. A Gaussian target heatmap is generated around the projected center:
 
@@ -192,7 +226,7 @@ We evaluate both heatmap quality and placement accuracy using peak distance:
 d_peak = ||argmax(H) - u_gt||_2
 ```
 
-### 4.4 Feasibility-Constrained Expectation Maximization
+### 4.5 Feasibility-Constrained Expectation Maximization
 
 The heatmap alone represents human placement preference, but it may place probability mass in physically impossible regions. We therefore project the 3D feasibility mask into the top-down image plane and obtain a binary image-space mask:
 
@@ -208,7 +242,7 @@ u_0 = argmax_u H_theta(u | I_room, I_obj, q) M(u)
 
 This makes the first stage an explicit constrained optimization problem: find the most human-preferred placement that is still geometrically feasible before simulation.
 
-### 4.5 Two-Stage Placement Optimization
+### 4.6 Two-Stage Placement Optimization
 
 We formulate placement as a two-stage optimization problem. The first stage finds the maximum of a learned human-aligned expectation field under geometric feasibility:
 
@@ -225,7 +259,7 @@ p* = Phi_phys(p_0^release, S)
 
 where `Phi_phys` is implemented by Isaac Sim drop-and-settle. Intuitively, the first stage answers where the object is expected to be placed by a human, while the second stage lets the object fall into a physically feasible stable pose.
 
-### 4.6 2D-to-3D Release Pose Lifting
+### 4.7 2D-to-3D Release Pose Lifting
 
 Because the top-down view is rendered with a known orthographic camera, the masked heatmap maximum `u_0` can be mapped to a world-space ray. A support plane is represented as:
 
@@ -241,7 +275,7 @@ x_0 = Ray(u_0) intersection P
 
 The target object's canonical orientation can be predicted by an auxiliary head or inherited from the source scene.
 
-### 4.7 Bitset-Based 3D Feasibility Mask
+### 4.8 Bitset-Based 3D Feasibility Mask
 
 A direct SDF representation is expressive but memory-intensive. HAP-Place instead uses a compact 3D occupancy bitset as the primary feasibility representation.
 
@@ -275,7 +309,7 @@ A pose is feasible if collision is below a threshold, the target is inside the r
 
 This representation is memory-efficient. For example, a `512^3` grid uses about 16 MB as a bitset, compared with about 512 MB for a float32 SDF.
 
-### 4.8 Minimum-Height Physics Projection
+### 4.9 Minimum-Height Physics Projection
 
 The feasibility mask removes obviously invalid regions before optimization, but final physical validity is evaluated by simulation. After the masked maximum is lifted to a support point, HAP-Place computes the lowest release pose along the support-plane normal, then instantiates the target object in Isaac Sim and performs a drop-and-settle protocol.
 
@@ -346,9 +380,12 @@ We compare HAP-Place against:
 2. **LayoutGPT-style baseline**: receives structured scene JSON and text only, then outputs a 2D or 3D placement.
 3. **SceneReVis-style baseline**: emits an `add_object` tool call from scene state and user request.
 4. **PhyScene3D-style physics baseline**: uses constructive or optimization-based placement with physical constraints but without the learned dense prior.
-5. **Heatmap only**: uses the global heatmap peak without feasibility filtering.
-6. **Heatmap + 3D mask**: uses bitset feasibility filtering without Isaac Sim physics projection.
-7. **HAP-Place full**: masked heatmap maximization, bitset feasibility, and minimum-height Isaac Sim physics projection.
+5. **HSD-Coord**: a direct coordinate regressor trained with coordinate loss.
+6. **HSD-F**: shares the DINOv2/SigLIP encoders and two-way fusion decoder with HAP-Place, but uses a learned placement query plus MLP coordinate head.
+7. **Implicit-Score**: shares the same encoders and fusion module, but predicts a scalar placement score for each queried coordinate; inference evaluates a fixed grid and selects the highest score.
+8. **Heatmap only**: uses the global heatmap peak without feasibility filtering.
+9. **Heatmap + 3D mask**: uses bitset feasibility filtering without Isaac Sim physics projection.
+10. **HAP-Place full**: masked heatmap maximization, bitset feasibility, and minimum-height Isaac Sim physics projection.
 
 ### 5.3 Metrics
 
@@ -360,6 +397,8 @@ We report:
 - **Human preference**: pairwise A/B preference between predicted placements.
 - **Runtime**: end-to-end inference time and time breakdown per module.
 
+For all methods that output a 2D coordinate, physical metrics are computed by applying the same 2D-to-3D lifting and minimum-height drop-and-settle protocol used by HAP-Place. This keeps the representation comparison focused on the predicted placement coordinate rather than on different downstream physics procedures.
+
 ### 5.4 Main Results
 
 | Method | Peak Acc. | Median Dist. | Collision Rate | Stability | Runtime |
@@ -367,17 +406,20 @@ We report:
 | LayoutGPT-style | XX | XX | XX | XX | XX |
 | Qwen3-VL | XX | XX | XX | XX | XX |
 | PhyScene3D-style | XX | XX | XX | XX | XX |
+| HSD-Coord | XX | XX | XX | XX | XX |
+| HSD-F | XX | XX | XX | XX | XX |
+| Implicit-Score | XX | XX | XX | XX | XX |
 | Heatmap only | XX | XX | XX | XX | XX |
 | Heatmap + 3D mask | XX | XX | XX | XX | XX |
 | HAP-Place full | XX | XX | XX | XX | XX |
 
-The expected trend is that language and VLM baselines produce reasonable semantic placements but struggle with fine-grained coordinate recovery, while physics-first baselines are valid but slower and less aligned with the original human layout. HAP-Place should combine high placement accuracy with physical validity and faster inference.
+The expected trend is that language and VLM baselines produce reasonable semantic placements but struggle with fine-grained coordinate recovery, while physics-first baselines are valid but slower and less aligned with the original human layout. The representation study should show that HSD-F improves over HSD-Coord by using the same fusion backbone as HAP-Place, Implicit-Score improves over direct coordinate output by learning a queryable placement function, and HAP-Place achieves the best accuracy-efficiency tradeoff by exposing the dense response surface in one forward pass.
 
 ### 5.5 Ablation Studies
 
 We evaluate:
 
-- Output representation: HSD coordinate prediction vs SRS heatmap prediction.
+- Output representation: HSD-Coord vs HSD-F vs Implicit-Score vs HAP-Place.
 - Room encoder: SigLIP vs DINOv2.
 - Hidden dimension: 256 vs 512 vs 768.
 - Decoder depth: 1, 2, 3, and 4 two-way layers.
