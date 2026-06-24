@@ -96,3 +96,6 @@ checkpoints/
 
 # Visualization outputs
 visualizations**/
+
+# Agent
+.agents/

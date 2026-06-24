@@ -140,14 +140,15 @@ class VLMClient:
         logger.info(f"transformers 后端加载成功: {self._model.device}")
 
     def _build_prompt(self, desc: str) -> str:
-        """构建 SAM-Q 风格的 prompt"""
+        """Build the prompt used to generate the placement request text."""
         return (
-            "第一张图是包含所有物体的原始房间图，"
-            "第二张图是移除了某个物体后的房间图，"
-            "第三张图是被移除的物体的参考图。"
-            f"请对比这三张图，用简短的中文描述被移除的物体{desc}"
-            "原来放在什么位置，以及周围参照物的关系。"
-            "以 '请你将[物体名称]摆放在' 开头。"
+            "Image 1 is the original top-down room view containing all objects. "
+            "Image 2 is the same room after one target object has been removed. "
+            "Image 3 is a reference image of the removed target object. "
+            f"Compare the three images and write one short English placement request for the removed object: {desc}. "
+            "Describe where the object was originally placed and its spatial relationship to nearby reference objects. "
+            "Start exactly with: 'Please place [object name]'. "
+            "Do not use Chinese. Do not include coordinates. Output only the request sentence."
         )
 
     def _save_cache(self):

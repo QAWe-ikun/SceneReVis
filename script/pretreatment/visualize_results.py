@@ -160,6 +160,7 @@ class Qwen3VLCoordinateBaseline:
     def __init__(
         self,
         model_path: str,
+        scene_json_dir: str,
         backend: str = "vllm",
         max_tokens: int = 768,
         temperature: float = 0.0,
@@ -167,6 +168,7 @@ class Qwen3VLCoordinateBaseline:
         refresh_cache: bool = False,
     ):
         self.model_path = Path(model_path)
+        self.scene_json_dir = Path(scene_json_dir)
         self.backend = backend
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -176,8 +178,9 @@ class Qwen3VLCoordinateBaseline:
         self._processor = None
         self._vllm_engine = None
         self._cache = {}
+        self._scene_cache = {}
 
-        if self.cache_path and self.cache_path.exists():
+        if self.cache_path and self.cache_path.exists() and not self.refresh_cache:
             try:
                 with open(self.cache_path, "r", encoding="utf-8") as f:
                     self._cache = json.load(f)
@@ -189,6 +192,8 @@ class Qwen3VLCoordinateBaseline:
             return
         if not self.model_path.exists():
             raise RuntimeError(f"Qwen3-VL model path does not exist: {self.model_path}")
+        if not self.scene_json_dir.exists():
+            raise RuntimeError(f"Scene JSON directory does not exist: {self.scene_json_dir}")
         if self.backend == "vllm":
             self._load_vllm_backend()
         else:
@@ -204,7 +209,7 @@ class Qwen3VLCoordinateBaseline:
                 model=str(self.model_path),
                 limit_mm_per_prompt={"image": 2},
                 gpu_memory_utilization=0.9,
-                max_model_len=4096,
+                max_model_len=8192,
                 swap_space=8,
                 trust_remote_code=True,
                 disable_log_stats=True,
@@ -236,8 +241,91 @@ class Qwen3VLCoordinateBaseline:
         self._model.eval()
 
     @staticmethod
-    def _build_prompt(desc: str, image_size: Tuple[int, int]) -> str:
+    def _clean_scene_object(obj: dict, pixel_center: Optional[Tuple[float, float]] = None) -> dict:
+        cleaned = {}
+        for key in ("desc", "size", "pos", "rot", "jid"):
+            if key in obj:
+                cleaned[key] = obj[key]
+        if pixel_center is not None:
+            cleaned["pixel_center_2d"] = [round(float(pixel_center[0]), 1), round(float(pixel_center[1]), 1)]
+        return cleaned
+
+    @staticmethod
+    def _world_to_pixel(pos: list, bounds_bottom: list, image_size: Tuple[int, int]) -> Optional[Tuple[float, float]]:
+        if not pos or len(pos) < 3 or not bounds_bottom:
+            return None
+        try:
+            xs = [float(p[0]) for p in bounds_bottom]
+            zs = [float(p[2]) for p in bounds_bottom]
+            cx = (min(xs) + max(xs)) / 2.0
+            cz = (min(zs) + max(zs)) / 2.0
+            ortho_scale = max(max(xs) - min(xs), max(zs) - min(zs))
+            if ortho_scale <= 0:
+                return None
+            image_w, image_h = image_size
+            x = ((float(pos[0]) - cx) / ortho_scale + 0.5) * image_w
+            y = ((float(pos[2]) - cz) / ortho_scale + 0.5) * image_h
+            return float(np.clip(x, 0, image_w - 1)), float(np.clip(y, 0, image_h - 1))
+        except Exception:
+            return None
+
+    def _load_scene(self, scene_name: str) -> dict:
+        if scene_name in self._scene_cache:
+            return self._scene_cache[scene_name]
+        scene_path = self.scene_json_dir / f"{scene_name}.json"
+        if not scene_path.exists():
+            raise FileNotFoundError(f"Scene JSON not found: {scene_path}")
+        with open(scene_path, "r", encoding="utf-8") as f:
+            scene = json.load(f)
+        self._scene_cache[scene_name] = scene
+        return scene
+
+    def _build_current_scene(self, sample: dict, image_size: Tuple[int, int]) -> dict:
+        scene_name = sample.get("scene_name")
+        if not scene_name:
+            raise ValueError("Sample has no scene_name; cannot build SceneReVis prompt")
+
+        source_scene = self._load_scene(scene_name)
+        removed = sample.get("removed_object", {})
+        removed_idx = removed.get("instance_id")
+        removed_jid = removed.get("jid")
+        bounds_bottom = source_scene.get("bounds_bottom", [])
+
+        objects = source_scene.get("objects", [])
+        kept_objects = []
+        for idx, obj in enumerate(objects):
+            is_removed = False
+            if isinstance(removed_idx, int):
+                is_removed = idx == removed_idx
+            elif removed_jid is not None:
+                is_removed = obj.get("jid") == removed_jid
+            if is_removed:
+                continue
+            kept_objects.append(
+                self._clean_scene_object(
+                    obj,
+                    pixel_center=self._world_to_pixel(obj.get("pos"), bounds_bottom, image_size),
+                )
+            )
+
+        target_object = self._clean_scene_object(removed)
+        target_object.pop("pos", None)
+        target_object.pop("gt_pixel_center", None)
+        target_object.pop("gt_center_source", None)
+
+        return {
+            "room_type": source_scene.get("room_type"),
+            "room_id": source_scene.get("room_id"),
+            "bounds_top": source_scene.get("bounds_top"),
+            "bounds_bottom": bounds_bottom,
+            "objects": kept_objects,
+            "target_object_to_add": target_object,
+        }
+
+    @staticmethod
+    def _build_prompt(desc: str, image_size: Tuple[int, int], current_scene: dict) -> str:
         width, height = image_size
+        current_scene_json = json.dumps(current_scene, ensure_ascii=False, indent=2)
         return (
             "### Role and Core Directive\n\n"
             "You are an AI spatial layout planner. Your core task is to analyze and optimize "
@@ -250,11 +338,20 @@ class Qwen3VLCoordinateBaseline:
             "* Image 1: a top-down room view after the target object has been removed. Use this as "
             "the primary basis for judging relative positions, free space, object spacing, and room boundaries.\n"
             "* Image 2: a reference image of the target object to add back into the room.\n\n"
+            "You are also given the SceneReVis `<current_scene>` JSON after the target object has been removed. "
+            "Existing objects include 3D world coordinates in `pos` and projected top-down image coordinates in "
+            "`pixel_center_2d`. Use these structured coordinates to resolve anchor objects, left/right/front/back "
+            "relations, and symmetric or repeated furniture.\n\n"
             "Mandatory requirements:\n"
             "1. Place the object in a physically valid location without obvious overlap with existing objects.\n"
             "2. Prefer a functionally reasonable placement that matches the surrounding furniture layout.\n"
             "3. Use the top-down view coordinate system for the final placement point. The origin is the top-left "
             f"corner of Image 1, x increases to the right, y increases downward, and Image 1 is {width}x{height} pixels.\n\n"
+            "<current_scene>\n"
+            "```json\n"
+            f"{current_scene_json}\n"
+            "```\n"
+            "</current_scene>\n\n"
             "### Available Tools\n\n"
             "**add_object**: Add a new furniture piece. This visualization baseline extends the SceneReVis "
             "tool arguments with `position_2d_pixel` so the result can be compared with heatmap peaks.\n"
@@ -263,11 +360,14 @@ class Qwen3VLCoordinateBaseline:
             "### Current User Request\n\n"
             f"{desc}\n\n"
             "### Output Format Requirements\n\n"
-            "You must follow the SceneReVis editing format exactly: first `<think>`, then `<tool_calls>`.\n"
-            "Keep `<think>` concise so the complete `<tool_calls>` block is always emitted. "
-            "Return exactly one `add_object` call. Do not use markdown fences.\n\n"
+            "You must follow the SceneReVis editing format exactly: first `<think>`, then `<tool_calls>`. "
+            "Use English only in the response. "
+            "Do not output markdown fences. Do not output a standalone JSON block. "
+            "The final answer must contain the `<tool_calls>` XML tag. "
+            "Keep `<think>` to few sentences so the complete `<tool_calls>` block is always emitted. "
+            "Return exactly one `add_object` call.\n\n"
             "<think>\n"
-            "[Briefly analyze the top-down room view, free space, surrounding furniture, and the best placement point.]\n"
+            "[Few sentences thinking how to place.]\n"
             "</think>\n\n"
             "<tool_calls>\n"
             "[\n"
@@ -297,21 +397,83 @@ class Qwen3VLCoordinateBaseline:
                 return None
             return float(np.clip(x, 0, width - 1)), float(np.clip(y, 0, height - 1))
 
+        def extract_from_data(data) -> Optional[Tuple[float, float]]:
+            if isinstance(data, list):
+                for item in data:
+                    parsed = extract_from_data(item)
+                    if parsed is not None:
+                        return parsed
+                return None
+            if not isinstance(data, dict):
+                return None
+
+            args = data.get("arguments")
+            if isinstance(args, dict):
+                parsed = extract_from_data(args)
+                if parsed is not None:
+                    return parsed
+
+            for key in ("position_2d_pixel", "pixel_position", "image_position", "position"):
+                parsed = normalize_coord(data.get(key))
+                if parsed is not None:
+                    return parsed
+            if "x" in data and "y" in data:
+                try:
+                    return normalize_coord([data["x"], data["y"]])
+                except Exception:
+                    return None
+            return None
+
+        def iter_json_blocks(raw_text: str):
+            code_blocks = re.findall(r"```(?:json)?\s*(.*?)\s*```", raw_text, flags=re.DOTALL | re.IGNORECASE)
+            for block in code_blocks:
+                yield block.strip()
+
+            for start_char, end_char in (("[", "]"), ("{", "}")):
+                starts = [m.start() for m in re.finditer(re.escape(start_char), raw_text)]
+                for start in starts:
+                    depth = 0
+                    in_string = False
+                    escape = False
+                    for idx in range(start, len(raw_text)):
+                        ch = raw_text[idx]
+                        if in_string:
+                            if escape:
+                                escape = False
+                            elif ch == "\\":
+                                escape = True
+                            elif ch == '"':
+                                in_string = False
+                            continue
+                        if ch == '"':
+                            in_string = True
+                        elif ch == start_char:
+                            depth += 1
+                        elif ch == end_char:
+                            depth -= 1
+                            if depth == 0:
+                                yield raw_text[start:idx + 1]
+                                break
+
         tool_match = re.search(r"<tool_calls>\s*(.*?)\s*</tool_calls>", text, flags=re.DOTALL)
         if tool_match:
             try:
-                tool_calls = json.loads(tool_match.group(1).strip())
-                if isinstance(tool_calls, list) and tool_calls:
-                    args = tool_calls[0].get("arguments", {})
-                    for key in ("position_2d_pixel", "pixel_position", "image_position", "position"):
-                        coord = normalize_coord(args.get(key))
-                        if coord is not None:
-                            return coord
+                parsed = extract_from_data(json.loads(tool_match.group(1).strip()))
+                if parsed is not None:
+                    return parsed
+            except Exception:
+                pass
+
+        for block in iter_json_blocks(text):
+            try:
+                parsed = extract_from_data(json.loads(block))
+                if parsed is not None:
+                    return parsed
             except Exception:
                 pass
 
         key_match = re.search(
-            r"(?:position_2d_pixel|pixel_position|image_position|position)\s*[:=]\s*\[([^\]]+)\]",
+            r"\"?(?:position_2d_pixel|pixel_position|image_position|position)\"?\s*[:=]\s*\[([^\]]+)\]",
             text,
             flags=re.DOTALL,
         )
@@ -319,28 +481,6 @@ class Qwen3VLCoordinateBaseline:
             nums = re.findall(r"-?\d+(?:\.\d+)?", key_match.group(1))
             if len(nums) >= 2:
                 return normalize_coord([nums[0], nums[1]])
-
-        json_match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
-        if json_match:
-            try:
-                data = json.loads(json_match.group(0))
-                if "arguments" in data:
-                    data = data["arguments"]
-                coord = (
-                    data.get("position_2d_pixel")
-                    or data.get("pixel_position")
-                    or data.get("image_position")
-                    or data.get("position")
-                )
-                parsed = normalize_coord(coord)
-                if parsed is not None:
-                    return parsed
-                if "x" in data and "y" in data:
-                    x = float(data["x"])
-                    y = float(data["y"])
-                    return normalize_coord([x, y])
-            except Exception:
-                pass
 
         return None
 
@@ -358,26 +498,35 @@ class Qwen3VLCoordinateBaseline:
         self,
         room_img: Image.Image,
         object_img: Image.Image,
-        desc: str,
+        sample: dict,
         cache_key: str,
-    ) -> Tuple[Optional[Tuple[float, float]], Optional[str]]:
+    ) -> Tuple[Optional[Tuple[float, float]], Optional[str], Optional[str]]:
         if not self.refresh_cache and cache_key in self._cache:
             cached = self._cache[cache_key]
             coord = cached.get("coord")
-            if coord is not None:
-                return (float(coord[0]), float(coord[1])), cached.get("response")
+            if coord is None and cached.get("response"):
+                coord = self._parse_coordinate(cached["response"], room_img.size)
+                if coord is not None:
+                    cached["coord"] = list(coord)
+                    self._save_cache()
+            parsed_coord = (float(coord[0]), float(coord[1])) if coord is not None else None
+            return parsed_coord, cached.get("response"), cached.get("prompt")
 
         self._load_model()
-        prompt = self._build_prompt(desc, room_img.size)
+        current_scene = self._build_current_scene(sample, room_img.size)
+        prompt = self._build_prompt(sample["object_desc"], room_img.size, current_scene)
         response = self._generate(room_img, object_img, prompt)
         coord = self._parse_coordinate(response or "", room_img.size) if response else None
 
         self._cache[cache_key] = {
             "coord": list(coord) if coord is not None else None,
             "response": response,
+            "prompt": prompt,
+            "current_scene": current_scene,
+            "prompt_mode": "scenerevis_current_scene_v1",
         }
         self._save_cache()
-        return coord, response
+        return coord, response, prompt
 
     def _generate(self, room_img: Image.Image, object_img: Image.Image, prompt: str) -> Optional[str]:
         if self.backend == "vllm":
@@ -432,13 +581,15 @@ class Qwen3VLCoordinateBaseline:
         ).to(self._model.device)
 
         with torch.no_grad():
+            generation_kwargs = {
+                "max_new_tokens": self.max_tokens,
+                "do_sample": self.temperature > 0,
+            }
+            if self.temperature > 0:
+                generation_kwargs["temperature"] = self.temperature
             output_ids = self._model.generate(
                 **inputs,
-                generation_config=GenerationConfig(
-                    max_new_tokens=self.max_tokens,
-                    do_sample=self.temperature > 0,
-                    temperature=max(self.temperature, 1e-5),
-                ),
+                generation_config=GenerationConfig(**generation_kwargs),
             )
         input_len = inputs["input_ids"].shape[1]
         result = self._processor.decode(
@@ -598,14 +749,14 @@ def visualize_sample(
     if qwen3_baseline is not None:
         try:
             cache_key = (
-                f"scenerevis_prompt_v2_mt{qwen3_baseline.max_tokens}_"
+                f"scenerevis_current_scene_v1_mt{qwen3_baseline.max_tokens}_"
                 f"{sample.get('sample_id', '')}_{sample.get('text_source', '')}_"
                 f"{sample.get('object_desc', '')[:80]}"
             )
-            qwen_peak_overlay, qwen_response = qwen3_baseline.predict(
+            qwen_peak_overlay, qwen_response, _ = qwen3_baseline.predict(
                 room_img=room_img,
                 object_img=object_img,
-                desc=sample["object_desc"],
+                sample=sample,
                 cache_key=cache_key,
             )
             if qwen_peak_overlay is not None:
@@ -759,6 +910,8 @@ def main():
     parser.add_argument("--split", type=str, default="val", help="Dataset split (train/val/test)")
     parser.add_argument("--qwen3-vl-model", type=str, default="/mnt/f/models/qwen3_vl",
                         help="Qwen3-VL model path for coordinate baseline")
+    parser.add_argument("--scene_json_dir", type=str, default=None,
+                        help="Original SceneReVis/3D-FRONT scene JSON directory for Qwen3-VL current_scene prompts")
     parser.add_argument("--qwen3-vl-backend", type=str, default="vllm",
                         choices=["vllm", "transformers"], help="Qwen3-VL inference backend")
     parser.add_argument("--qwen3-vl-max-tokens", type=int, default=768,
@@ -853,18 +1006,25 @@ def main():
 
     qwen3_baseline = None
     if not args.disable_qwen3_vl_baseline and args.qwen3_vl_model:
+        if not args.scene_json_dir:
+            raise ValueError("--scene_json_dir is required when Qwen3-VL baseline is enabled")
         qwen3_model_path = Path(args.qwen3_vl_model)
+        scene_json_dir = Path(args.scene_json_dir)
         if qwen3_model_path.exists():
-            cache_path = Path(args.qwen3_vl_cache) if args.qwen3_vl_cache else output_dir / "qwen3_vl_coords_cache.json"
+            if not scene_json_dir.exists():
+                raise FileNotFoundError(f"Scene JSON directory not found: {scene_json_dir}")
+            cache_path = Path(args.qwen3_vl_cache) if args.qwen3_vl_cache else output_dir / "qwen3_vl_scenerevis_results.json"
             qwen3_baseline = Qwen3VLCoordinateBaseline(
                 model_path=str(qwen3_model_path),
+                scene_json_dir=str(scene_json_dir),
                 backend=args.qwen3_vl_backend,
                 max_tokens=args.qwen3_vl_max_tokens,
                 temperature=0.0,
                 cache_path=cache_path,
                 refresh_cache=args.refresh_qwen3_vl_cache,
             )
-            logging.info(f"Qwen3-VL coordinate baseline enabled: {qwen3_model_path}")
+            logging.info(f"Qwen3-VL SceneReVis coordinate baseline enabled: {qwen3_model_path}")
+            logging.info(f"Qwen3-VL SceneReVis scene JSON dir: {scene_json_dir}")
             logging.info(f"Qwen3-VL coordinate cache: {cache_path}")
             logging.info(f"Qwen3-VL max new tokens: {args.qwen3_vl_max_tokens}")
             logging.info(f"Qwen3-VL refresh cache: {args.refresh_qwen3_vl_cache}")

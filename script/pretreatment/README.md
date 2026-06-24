@@ -153,13 +153,13 @@ print(f'示例: {json.dumps(samples[0], indent=2, ensure_ascii=False)}')
 
 ## VLM 描述生成
 
-启用 VLM 后，使用 Qwen3-VL 对比 3 张图生成中文摆放描述，比 TextProcessor 的静态描述信息更丰富。
+启用 VLM 后，使用 Qwen3-VL 对比 3 张图生成英文摆放请求，比 TextProcessor 的静态描述信息更丰富，并避免训练/可视化 prompt 中英文混用。
 
 ### 工作流程
 
 1. 渲染完整场景俯视图 (每个场景只渲染一次)
 2. 对每个目标物体: 渲染剔除后房间 + 物体参考图
-3. 将 3 张图送入 Qwen3-VL，生成描述 (如 "请你将[床]摆放在房间左侧靠墙的位置...")
+3. 将 3 张图送入 Qwen3-VL，生成英文描述 (如 "Please place the bed against the left wall of the room...")
 4. VLM 失败时自动回退到 TextProcessor
 
 ### 启用配置
