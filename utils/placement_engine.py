@@ -106,6 +106,16 @@ class PlacementEngine:
             print(f"[placement] Failed to find position for '{object_desc}'")
             return None
 
+        # Store heatmap data for external visualization
+        self.last_heatmap = heatmap
+        self.last_score = score
+        self.last_mask = mask
+        self.last_ortho_scale = ortho_scale
+        self.last_cx = cx
+        self.last_cz = cz
+        self.last_top_view_path = top_view_path
+        self.last_object_desc = object_desc
+
         print(f"[placement] Optimal position for '{object_desc}': {positions[0]}")
         return positions[0]
 

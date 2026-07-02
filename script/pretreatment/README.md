@@ -212,24 +212,6 @@ python train_heatmap.py \
   --lr 1e-4 \
   --resume checkpoints/heatmap/latest.pth
 
-# HSD-F baseline: same DINOv2/SigLIP two-way fusion, learned query + MLP coordinate head
-python train_hsd_f.py \
-  --data_dir /path/to/heatmap_data \
-  --output_dir checkpoints/hsd_f_dinov2_twoway_hd256 \
-  --epochs 20 \
-  --batch_size 2 \
-  --lr 1e-4 \
-  --min_lr 1e-6 \
-  --warmup_steps 1000 \
-  --lr_scheduler step_cosine \
-  --num_workers 4 \
-  --room_encoder dinov2 \
-  --dino_model "$SCENEREVIS_DINOV2_MODEL" \
-  --hidden_dim 256 \
-  --decoder_layers 3 \
-  --num_heads 8 \
-  --mlp_ratio 4.0 \
-  --decoder_dropout 0.0
 ```
 
 **训练参数**:
