@@ -35,6 +35,7 @@ qwen_vl_utils==0.0.11
 # ===== Physics & 3D Processing =====
 # Trimesh: 3D mesh processing (for physics validation and collision detection)
 trimesh>=4.0.0
+rtree>=1.2.0
 
 # NumPy: Numerical computing (version capped to avoid compatibility issues)
 numpy<2.0.0

@@ -16,6 +16,7 @@ class SceneBuilder:
 
     def __init__(self, model_dir: Path):
         self.model_dir = Path(model_dir)
+        self._mesh_cache: Dict[Path, trimesh.Trimesh] = {}
 
     def find_model_path(self, model_id: str) -> Optional[Path]:
         """查找模型文件"""
@@ -52,8 +53,15 @@ class SceneBuilder:
 
     def load_mesh(self, model_path: Path) -> Optional[trimesh.Trimesh]:
         """加载网格"""
+        model_path = Path(model_path)
+        cached = self._mesh_cache.get(model_path)
+        if cached is not None:
+            return cached.copy()
         try:
             loaded = trimesh.load(model_path, force='mesh')
+            if not isinstance(loaded, trimesh.Trimesh):
+                return None
+            self._mesh_cache[model_path] = loaded.copy()
             return loaded
         except Exception:
             return None

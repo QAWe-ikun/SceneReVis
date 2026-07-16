@@ -388,3 +388,306 @@ heatmap[gi=X, gj=Z]
   - `text_processor.py`: 文本增强
   - `vlm_client.py`: VLM 描述生成 (Qwen3-VL)
 - `models.py`: 数据结构定义
+
+## HAP-Place P0 pipeline
+
+The complete release pipeline is implemented by:
+
+- `utils/hap_place.py`: calibrated rays, exact first-hit mesh intersections,
+  packed 3D occupancy, target voxelization, and score-ordered release search.
+- `run_hap_place.py`: heatmap inference, SceneReVis pose loading, scene
+  reconstruction, release search, result JSON, and the Isaac Sim handoff.
+- `run_isaac_settle.py`: Isaac Sim 6.x drop-and-settle worker.
+
+Install the exact ray-intersection dependency in the WSL environment:
+
+```bash
+pip install rtree
+```
+
+SceneReVis results must be keyed by `sample_id` and contain an `add_object`
+tool call with `rotation` plus either `scale` or `size`:
+
+```json
+{
+  "obj_0001_example": {
+    "tool_calls": [
+      {
+        "name": "add_object",
+        "arguments": {
+          "rotation": [0.0, 0.0, 0.0, 1.0],
+          "size": [0.8, 1.1, 0.7]
+        }
+      }
+    ]
+  }
+}
+```
+
+Generate the pose file with the SceneReVis-7B checkpoint. The command resumes
+valid records in the existing JSON; `--refresh` explicitly regenerates all
+selected samples, while invalid records are retried automatically.
+
+```bash
+python script/pretreatment/generate_scenerevis_poses.py \
+  --data_dir /mnt/f/scenerevis/output/heatmap_data \
+  --split test \
+  --scene_json_dir /mnt/d/3D-Dataset/dataset-ssr3dfront/scenes \
+  --model "$SCENEREVIS_MODEL" \
+  --backend vllm \
+  --output_json outputs/scenerevis_pose_results.json \
+  --batch_size 8 \
+  --max_tokens 768
+```
+
+Run release search without starting Isaac Sim:
+
+```bash
+python script/pretreatment/run_hap_place.py \
+  --data_dir /mnt/f/scenerevis/output/heatmap_data \
+  --split val \
+  --checkpoint checkpoints/heatmap_dinov2_twoway_hd256/best_peak.pth \
+  --scene_json_dir /mnt/d/3D-Dataset/dataset-ssr3dfront/scenes \
+  --model_dir /mnt/d/3D-Dataset/3D-FUTURE-model \
+  --scenerevis_results outputs/scenerevis_pose_results.json \
+  --output_json outputs/hap_place_val.json \
+  --num_samples 10 \
+  --voxel_resolution 256 \
+  --minimum_release_height_voxels 1 \
+  --physics_backend none
+```
+
+`--minimum_release_height_voxels` adds a fixed empty layer below the target
+voxel kernel. Each unique first-hit surface candidate is tested exactly once at
+this height. A collision rejects the candidate immediately and advances the
+search to the next-highest heatmap response; release height is never traversed.
+
+For a one-sample geometry smoke test, `--allow_metadata_pose` explicitly uses
+the removed-object metadata instead of SceneReVis rotation/scale. Results from
+this debug mode must not be reported as the full HAP-Place method.
+
+For a one-sample Isaac Sim smoke test, run the integrated backend. This starts
+one Isaac process per sample and is intended for debugging rather than dataset
+evaluation:
+
+```bash
+python script/pretreatment/run_hap_place.py \
+  --data_dir /mnt/f/scenerevis/output/heatmap_data \
+  --split test \
+  --checkpoint checkpoints/heatmap_dinov2_twoway_hd256/best_peak.pth \
+  --scene_json_dir /mnt/d/3D-Dataset/dataset-ssr3dfront/scenes \
+  --model_dir /mnt/d/3D-Dataset/3D-FUTURE-model \
+  --scenerevis_results outputs/scenerevis_pose_results.json \
+  --output_json outputs/hap_place_isaac_smoke.json \
+  --num_samples 1 \
+  --physics_backend isaac \
+  --isaac_python /path/to/isaac-sim/python.sh \
+  --save_physics_usd
+```
+
+### Windows Isaac Sim producer-consumer execution
+
+The recommended dataset-scale deployment keeps model inference in WSL and runs
+one or more persistent Isaac Sim consumers on Windows. Download the Isaac Sim
+6.x workstation archive, extract it to `C:\isaacsim`, and complete its one-time
+setup from PowerShell:
+
+```powershell
+Set-Location C:\isaacsim
+.\isaac-sim.compatibility_check.bat
+.\post_install.bat
+$env:OMNI_KIT_ACCEPT_EULA = "YES"
+```
+
+First run `run_hap_place.py --physics_backend none` in WSL. It writes portable
+manifests whose internal geometry and result paths are relative to each
+manifest. Publish all valid release poses to a queue on the shared Windows
+drive:
+
+```bash
+python script/pretreatment/enqueue_isaac_jobs.py \
+  --input_json /mnt/e/project/SceneReVis/outputs/hap_place_val.json \
+  --shared_root /mnt/e/project/SceneReVis \
+  --queue_root /mnt/e/project/SceneReVis/outputs/physics_queue \
+  --max_retries 2
+```
+
+Start a persistent Windows consumer. One `SimulationApp` is created at startup
+and reused for every claimed job:
+
+```powershell
+$env:OMNI_KIT_ACCEPT_EULA = "YES"
+C:\isaacsim\python.bat `
+  E:\project\SceneReVis\script\pretreatment\run_isaac_consumer.py `
+  --shared_root E:\project\SceneReVis `
+  --queue_root E:\project\SceneReVis\outputs\physics_queue `
+  --worker_id isaac-gpu0 `
+  --gpu 0
+```
+
+For multiple GPUs, start one command in a separate PowerShell terminal per GPU
+and give every process a unique `--worker_id` and `--gpu`. Begin with one
+consumer on a single GPU; multiple full Isaac applications on the same GPU can
+reduce throughput through memory pressure and context contention.
+
+The queue has `pending`, `running/<worker_id>`, `done`, and `failed` states.
+Publishing and claiming use atomic same-volume renames. Consumers emit heartbeat
+leases while physics is running. Inspect the queue or recover consumers that
+have stopped heartbeating for ten minutes:
+
+```bash
+python script/pretreatment/manage_isaac_queue.py status \
+  --queue_root /mnt/e/project/SceneReVis/outputs/physics_queue
+
+python script/pretreatment/manage_isaac_queue.py recover \
+  --queue_root /mnt/e/project/SceneReVis/outputs/physics_queue \
+  --stale_seconds 600 \
+  --watch_interval 30
+```
+
+An Isaac execution exception is retried up to `--max_retries`. A completed
+simulation that returns `sim_ready=false` is a valid physical evaluation and
+moves to `done`; it is not retried. After consumers drain the queue, merge all
+available settled results into one JSON from WSL:
+
+```bash
+python script/pretreatment/manage_isaac_queue.py merge \
+  --input_json /mnt/e/project/SceneReVis/outputs/hap_place_val.json \
+  --output_json /mnt/e/project/SceneReVis/outputs/hap_place_val_simready.json \
+  --shared_root /mnt/e/project/SceneReVis
+```
+
+Use `--refresh_terminal` when enqueueing only when intentionally rerunning jobs
+already in `done` or `failed`. Existing `pending` or `running` jobs are never
+duplicated.
+
+For a local same-system batch evaluation, `run_isaac_batch.py` remains a simpler
+alternative. It processes every emitted manifest in one Isaac Sim process and
+merges the settled poses into a new single JSON:
+
+```bash
+export OMNI_KIT_ACCEPT_EULA=YES
+
+python script/pretreatment/run_isaac_batch.py \
+  --input_json outputs/hap_place_val.json \
+  --output_json outputs/hap_place_val_simready.json \
+  --isaac_python /path/to/isaac-sim/python.sh \
+  --timeout 7200
+```
+
+Batch execution reruns all manifests by default. Pass `--skip_completed` only
+when intentionally resuming valid `hap_place_isaac_result_v2` files.
+
+The default camera exactly matches the current orthographic training renderer.
+For an arbitrary calibrated perspective view, pass `--camera_json` with this
+shape:
+
+```json
+{
+  "projection": "perspective",
+  "image_width": 1024,
+  "image_height": 1024,
+  "convention": "opencv",
+  "intrinsics": [[800, 0, 512], [0, 800, 512], [0, 0, 1]],
+  "camera_to_world": [
+    [1, 0, 0, 0],
+    [0, 1, 0, 1.5],
+    [0, 0, 1, -3],
+    [0, 0, 0, 1]
+  ]
+}
+```
+
+`run_hap_place.py` writes one crash-resilient JSON. Simulator geometry and
+manifests are kept under a hidden `.<output_stem>_work` directory next to it.
+Each successful record contains the score-ordered release candidate, exact
+mesh first hit, packed scene/target voxel statistics, release transform, and a
+`simulator_record`. With the Isaac backend, `simulator_record.pose_stage` is
+`settled`; otherwise it is `release`. The 4x4 `original_to_world` transform is
+the authoritative pose and avoids ambiguity from scale encoded in legacy
+`jid` strings.
+
+Both scene occupancy and the transformed target kernel are packed into
+`uint64` rows. Candidate collision checks shift the target rows to the release
+anchor and use bitwise intersection. Occupancy construction uses conservative
+triangle-AABB voxelization: triangle bounds provide the broad phase, a 13-axis
+SAT test marks every intersecting voxel, and watertight surfaces are filled.
+The cubic grid extent is derived only from the room envelope with 2% padding;
+target height never expands `max_y`. Within that finite grid, every voxel whose
+center lies outside the room's extruded XZ polygon or below/above its
+floor/ceiling interval is explicitly set to one. A target kernel extending
+beyond the finite grid is also rejected as a collision.
+Mesh-ray projection strictly requires `rtree`; there is no voxel-ray fallback.
+A sample also fails if any scene mesh cannot be voxelized, so incomplete
+occupancy is never accepted silently. Result JSON records the method as
+`conservative_triangle_aabb_sat_v1`.
+
+Run the focused WSL checks before a full evaluation:
+
+```bash
+source setup_env.sh
+pip install rtree pytest
+python -m pytest tests/test_hap_place.py -q
+python -m pytest tests/test_isaac_settle.py -q
+
+python script/pretreatment/generate_scenerevis_poses.py \
+  --data_dir /mnt/f/scenerevis/output/heatmap_data \
+  --split val \
+  --scene_json_dir /mnt/d/3D-Dataset/dataset-ssr3dfront/scenes \
+  --model "$SCENEREVIS_MODEL" \
+  --backend vllm \
+  --output_json outputs/scenerevis_pose_smoke.json \
+  --num_samples 1 \
+  --batch_size 1 \
+  --refresh
+
+python script/pretreatment/run_hap_place.py \
+  --data_dir /mnt/f/scenerevis/output/heatmap_data \
+  --split val \
+  --checkpoint checkpoints/heatmap_dinov2_twoway_hd256/best_peak.pth \
+  --scene_json_dir /mnt/d/3D-Dataset/dataset-ssr3dfront/scenes \
+  --model_dir /mnt/d/3D-Dataset/3D-FUTURE-model \
+  --scenerevis_results outputs/scenerevis_pose_smoke.json \
+  --output_json outputs/hap_place_smoke.json \
+  --num_samples 1 \
+  --physics_backend none
+```
+
+The Isaac worker reads PhysX contact reports directly. It converts negative
+contact separation into penetration depth and evaluates the maximum depth over
+the settled low-velocity window. SceneReVis geometry, calibration, and result
+JSON use a right-handed Y-up frame. At the simulator boundary, the worker maps
+project coordinates $(x,y,z)$ to Isaac Sim Z-up coordinates $(x,-z,y)$ for the
+scene, target, release pose, gravity, and contact tests. It maps the settled
+transform back to project Y-up before merging results. Therefore debug
+`settled.usda` files use Isaac's native Z-up convention, while final JSON poses
+remain in SceneReVis Y-up. A result is simulator-ready only when all of the
+following hold by default:
+
+- linear speed below `0.01 m/s` and angular speed below `0.05 rad/s` for 60
+  consecutive frames at 120 Hz;
+- support must first be established by a bottom PhysX contact with
+  `abs(dot(contact_normal, world_up)) >= 0.7`; after PhysX puts the rigid body
+  to sleep, the support state is retained only while motion remains below the
+  thresholds and bottom height stays within the contact-height tolerance;
+- settled penetration at most `0.005 m`;
+- tilt from the prepared SceneReVis orientation at most `15 degrees`;
+- horizontal displacement from the semantic release anchor at most `0.1 m`.
+
+The JSON also records peak transient penetration, raw contact/support frame
+counts, sleep-latched support frames, final speeds, tilt, displacement, contact
+force, and both prepared and original asset transforms. `--save_physics_usd`
+exports a per-sample `settled.usda` for debugging.
+
+Export any successful release or settled result as an interactive GLB:
+
+```bash
+python script/pretreatment/visualize_hap_place_3d.py \
+  --result_json outputs/hap_place_smoke.json \
+  --output_glb outputs/hap_place_smoke.glb
+```
+
+The scene is gray, the placed target is green, the exact first surface hit is
+orange, the release anchor is blue, and the dataset GT anchor is magenta. Use
+`--hide_gt` for a prediction-only visualization. The exporter automatically
+uses the settled pose after an Isaac run and the release pose otherwise.

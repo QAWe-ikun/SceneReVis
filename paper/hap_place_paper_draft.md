@@ -12,7 +12,7 @@ Large vision-language models and layout language models can reason about object 
 
 We propose to treat object placement as a two-stage optimization problem. First, a learned feed-forward model predicts a dense **demonstration-aligned placement prior** over the observation image, while a first-hit bitset release test constrains the maximization to image locations that can produce a collision-free release pose. The semantic release anchor is obtained by score-ordered early-exit maximization: candidates are visited from high to low heatmap value until the first release-feasible anchor is found. Second, a physics projection operator maps this release pose to a stable state by letting gravity and contact dynamics determine the final pose.
 
-Our framework, HAP-Place, follows this principle. Given a calibrated rendered observation after removing the target object, a reference image of the target object, and a text placement request, HAP-Place predicts a dense placement heatmap in the observation image. The heatmap model uses a DINOv2 scene encoder, SigLIP object and text encoders, and a multi-layer two-way decoder inspired by interactive segmentation decoders. We then build a compact 3D release representation using bitset occupancy. Each scene object is voxelized by parity ray crossing through its mesh, and per-object bitsets are combined with bitwise OR to obtain a scene occupancy bitset. Each heatmap pixel is lifted through the calibrated camera ray only to its first visible surface intersection; regions behind that first hit are treated as unknown rather than inferred through ray traversal. Given the rotation and scale from the SceneReVis tool-call output, we voxelize the target object as a fixed binary kernel and test candidate anchors with local bitset overlap. The final semantic release anchor is the highest heatmap value that admits a lowest collision-free release pose. Finally, this release pose is evaluated in Isaac Sim through a drop-and-settle protocol that measures stability, penetration, and support.
+Our framework, HAP-Place, follows this principle. Given a calibrated rendered observation after removing the target object, a reference image of the target object, and a text placement request, HAP-Place predicts a dense placement heatmap in the observation image. The heatmap model uses a DINOv2 scene encoder, SigLIP object and text encoders, and a multi-layer two-way decoder inspired by interactive segmentation decoders. We then build a compact 3D release representation using bitset occupancy. Each scene object is conservatively voxelized, and per-object bitsets are combined with bitwise OR to obtain a scene occupancy bitset. Each heatmap pixel is lifted through the calibrated camera ray only to its first visible surface intersection; regions behind that first hit are treated as unknown rather than inferred through ray traversal. Given the rotation and scale from the SceneReVis tool-call output, we voxelize the target object as a fixed binary kernel with a shared minimum release height and test candidate anchors with local bitset overlap. The final semantic release anchor is the highest heatmap value that is collision-free at this fixed height. Finally, this release pose is evaluated in Isaac Sim through a drop-and-settle protocol that measures stability, penetration, and support.
 
 The key insight is that physics should act as a grounding and projection layer, not as the only source of placement search. By using a learned prior, HAP-Place avoids expensive global simulation search. By evaluating release feasibility in heatmap-score order, HAP-Place naturally handles impossible peaks: if the unconstrained peak cannot yield a collision-free release state, the algorithm continues to the next highest-expectation visible anchor. Isaac Sim then turns the selected release pose into a physically stable final pose.
 
@@ -20,8 +20,8 @@ Our contributions are:
 
 1. We formulate object re-placement as a scalable simulator-data generation primitive for embodied AI, where outputs must be semantically correct, physically executable, and stable in simulation.
 2. We propose a feed-forward dense placement prior that fuses scene geometry, target object appearance, and text through a DINOv2/SigLIP two-way decoder.
-3. We introduce a score-ordered first-hit bitset release test based on parity mesh voxelization and target-object bitset correlation, enabling fast constrained maximization without global simulation search.
-4. We integrate a lowest-collision-free Isaac Sim drop-and-settle projection operator to convert selected semantic anchors into stable simulator-ready object placements.
+3. We introduce a score-ordered first-hit bitset release test based on conservative mesh voxelization and target-object bitset correlation, enabling fast constrained maximization without global simulation search or height traversal.
+4. We integrate a fixed-minimum-height Isaac Sim drop-and-settle projection operator to convert selected semantic anchors into stable simulator-ready object placements.
 5. We evaluate against LayoutGPT-style, SceneReVis/Qwen3-VL, and PhyScene3D-style baselines, measuring fine-grained placement accuracy, physical executability, stability, and runtime.
 
 ## 2. Related Work
@@ -48,9 +48,9 @@ Dense heatmap prediction has been widely used for pose estimation, affordance pr
 
 Let a scene be represented by a set of objects
 
-```
-S = {o_i = (c_i, m_i, s_i, p_i, r_i)}
-```
+$$
+\mathcal{S}=\{o_i=(c_i,m_i,s_i,p_i,r_i)\}.
+$$
 
 where `c_i` is category or description, `m_i` is mesh or asset identity, `s_i` is size, `p_i` is position, and `r_i` is rotation. During data construction, one target object `o_t` is removed from the scene, producing a removed scene `S^-`. The model receives:
 
@@ -63,15 +63,15 @@ where `c_i` is category or description, `m_i` is mesh or asset identity, `s_i` i
 
 The goal is to generate a simulator-ready final object pose
 
-```
-p_final = (x, y, z, R_sr)
-```
+$$
+p_{\mathrm{final}}=(x,y,z,R_{\mathrm{sr}}).
+$$
 
 that is semantically aligned with the request, collision-free at initialization, and stable after physics simulation. For image-space evaluation, the demonstrated target pose is projected into the calibrated observation:
 
-```
-u_gt = pi_{K,T}(p_t)
-```
+$$
+u_{\mathrm{gt}}=\pi_{K,T}(p_t).
+$$
 
 where `pi_{K,T}` is the known camera projection. A prediction is considered correct if the peak distance is below a tolerance threshold, such as 32 pixels in the evaluation image.
 
@@ -85,12 +85,18 @@ For embodied AI data generation, a placement is useful only if it can be execute
 
 HAP-Place treats object re-placement as a two-stage optimization problem:
 
-```
-u_0 = argmax_u H_theta(u | I_obs, I_obj, q)
-      s.t. M_rel(u, R_sr, s_sr) = 1
+$$
+u_0=\underset{u}{\operatorname{argmax}}\;
+H_{\theta}(u\mid I_{\mathrm{obs}},I_{\mathrm{obj}},q)
+\quad\text{s.t.}\quad
+M_{\mathrm{rel}}(u,R_{\mathrm{sr}},s_{\mathrm{sr}})=1,
+$$
 
-p* = Phi_phys(LiftToReleasePose(u_0, R_sr, s_sr), S)
-```
+$$
+p^*=\Phi_{\mathrm{phys}}\!\left(
+\operatorname{LiftToReleasePose}(u_0,R_{\mathrm{sr}},s_{\mathrm{sr}}),\mathcal{S}
+\right).
+$$
 
 Here `H_theta` is a feed-forward demonstration-aligned placement prior, `M_rel` is a first-hit release predicate evaluated by local bitset collision testing, and `Phi_phys` is Isaac Sim drop-and-settle. This formulation makes the fast neural component responsible for semantic placement and uses geometry and simulation as deterministic executability checks.
 
@@ -98,16 +104,19 @@ Here `H_theta` is a feed-forward demonstration-aligned placement prior, `M_rel` 
 
 HAP-Place focuses on placement-anchor and release-pose selection, not full 6-DoF object pose generation. Rotation and scale are treated as input conditions produced by the SceneReVis tool-call output:
 
-```
-SceneReVis(S^-, I_obs, I_obj, q) -> (R_sr, s_sr, optional coarse position)
-```
+$$
+\operatorname{SceneReVis}(\mathcal{S}^{-},I_{\mathrm{obs}},I_{\mathrm{obj}},q)
+\rightarrow(R_{\mathrm{sr}},s_{\mathrm{sr}},\text{optional coarse position}).
+$$
 
-HAP-Place discards the coarse SceneReVis coordinate for fine-grained placement, but keeps `R_sr` and `s_sr` fixed when voxelizing the target object and running the release test. The method therefore solves:
+HAP-Place discards the coarse SceneReVis coordinate for fine-grained placement, but keeps $R_{\mathrm{sr}}$ and $s_{\mathrm{sr}}$ fixed when voxelizing the target object and running the release test. The method therefore solves:
 
-```
-argmax_u H_theta(u | I_obs, I_obj, q)
-s.t. M_rel(u, R_sr, s_sr) = 1
-```
+$$
+\underset{u}{\operatorname{argmax}}\;
+H_{\theta}(u\mid I_{\mathrm{obs}},I_{\mathrm{obj}},q)
+\quad\text{s.t.}\quad
+M_{\mathrm{rel}}(u,R_{\mathrm{sr}},s_{\mathrm{sr}})=1.
+$$
 
 rather than claiming to solve unrestricted 6-DoF placement. This design isolates the main failure mode of VLM/tool-call systems in our setting: they often infer plausible orientation and scale but produce inaccurate coordinates. HAP-Place replaces the coordinate with a dense visual placement prior and physics-grounded release selection.
 
@@ -123,7 +132,7 @@ HAP-Place consists of three modules:
 
 1. Feed-forward placement prior
 2. Score-ordered first-hit bitset release test
-3. Lowest collision-free Isaac Sim physics projection
+3. Fixed-minimum-height Isaac Sim physics projection
 
 The pipeline is:
 
@@ -134,7 +143,7 @@ calibrated removed-scene observation + target object image + text
         -> first-hit visible surface lifting per candidate
         -> local bitset release test
         -> early-exit constrained maximum
-        -> lowest collision-free release pose
+        -> fixed-minimum-height release pose
         -> Isaac Sim drop-and-settle projection
         -> final stable pose
 ```
@@ -143,9 +152,10 @@ calibrated removed-scene observation + target object image + text
 
 The placement prior predicts a heatmap:
 
-```
-H = f_theta(I_obs, I_obj, q), H in [0, 1]^(H x W)
-```
+$$
+H=f_{\theta}(I_{\mathrm{obs}},I_{\mathrm{obj}},q),
+\qquad H\in[0,1]^{H\times W}.
+$$
 
 where high values indicate likely target object centers. The model contains:
 
@@ -161,44 +171,46 @@ The two-way decoder lets target object and text tokens query the scene layout wh
 
 For each training sample, the ground-truth object center is projected from 3D world coordinates into the calibrated observation image. A Gaussian target heatmap is generated around the projected center:
 
-```
-Y(u, v) = exp(-||[u, v] - u_gt||^2 / (2 sigma^2))
-```
+$$
+Y(u,v)=\exp\!\left(-\frac{\lVert[u,v]-u_{\mathrm{gt}}\rVert_2^2}{2\sigma^2}\right).
+$$
 
 The model is trained with weighted binary cross entropy:
 
-```
-L_heatmap = BCE_weighted(H, Y)
-```
+$$
+\mathcal{L}_{\mathrm{heatmap}}=\operatorname{BCE}_{\mathrm{weighted}}(H,Y).
+$$
 
 We evaluate both heatmap quality and placement accuracy using peak distance:
 
-```
-d_peak = ||argmax(H) - u_gt||_2
-```
+$$
+d_{\mathrm{peak}}=\left\lVert\operatorname{argmax}(H)-u_{\mathrm{gt}}\right\rVert_2.
+$$
 
 ### 4.4 Release-Constrained Expectation Maximization
 
 The heatmap alone represents human placement preference, but it may place probability mass on image locations that cannot produce a valid release state. We therefore define a binary release predicate in the heatmap domain:
 
-```
-M_rel(u, v) in {0, 1}
-```
+$$
+M_{\mathrm{rel}}(u,v)\in\{0,1\}.
+$$
 
-where `M_rel(u, v)=1` means the visible surface associated with pixel `(u,v)` can anchor a lowest collision-free release pose for the target object. In implementation, HAP-Place does not need to materialize a full image-domain release map before decision. It sorts image locations by heatmap value and tests them in descending order:
+where $M_{\mathrm{rel}}(u,v)=1$ means the visible surface associated with pixel $(u,v)$ is collision-free at the shared minimum release height. In implementation, HAP-Place does not need to materialize a full image-domain release map before decision. It sorts image locations by heatmap value and tests them in descending order:
 
-```
-u_1, u_2, ... = argsort_u H_theta(u | I_obs, I_obj, q)
-
-u_0 = first u_k such that M_rel(u_k) = 1
-```
+$$
+(u_1,u_2,\ldots)=\underset{u}{\operatorname{argsort}}\;
+H_{\theta}(u\mid I_{\mathrm{obs}},I_{\mathrm{obj}},q),
+\qquad
+u_0=u_{\min\{k:M_{\mathrm{rel}}(u_k)=1\}}.
+$$
 
 Because candidates are visited in descending score order, this early-exit procedure returns the exact solution over the discretized heatmap candidate set:
 
-```
-u_0 = argmax_u H_theta(u | I_obs, I_obj, q)
-      s.t. M_rel(u) = 1
-```
+$$
+u_0=\underset{u}{\operatorname{argmax}}\;
+H_{\theta}(u\mid I_{\mathrm{obs}},I_{\mathrm{obj}},q)
+\quad\text{s.t.}\quad M_{\mathrm{rel}}(u)=1.
+$$
 
 This makes the first stage an explicit constrained optimization problem: find the most layout-consistent visible anchor that can initialize physics simulation without interpenetration. Importantly, `M_rel` does not require the object to be statically supported before simulation. It only requires a valid release pose; final support and stability are determined by the drop-and-settle projection.
 
@@ -206,17 +218,19 @@ This makes the first stage an explicit constrained optimization problem: find th
 
 We formulate placement as a two-stage optimization problem. The first stage finds the maximum of a learned demonstration-aligned placement prior under geometric feasibility:
 
-```
-u_0 = argmax_u H_theta(u | I_obs, I_obj, q)
-      s.t. M_rel(u) = 1
-p_0^release = LiftToReleasePose(u_0, S, o_t)
-```
+$$
+u_0=\underset{u}{\operatorname{argmax}}\;
+H_{\theta}(u\mid I_{\mathrm{obs}},I_{\mathrm{obj}},q)
+\quad\text{s.t.}\quad M_{\mathrm{rel}}(u)=1,
+\qquad
+p_0^{\mathrm{release}}=\operatorname{LiftToReleasePose}(u_0,\mathcal{S},o_t).
+$$
 
-where `H_theta` is the dense placement heatmap, `M_rel` is evaluated by first-hit lifting and local bitset collision testing, and `LiftToReleasePose` maps the image-space optimum to the lowest collision-free 3D release pose of the target object. The second stage applies a physics projection operator:
+where $H_{\theta}$ is the dense placement heatmap, $M_{\mathrm{rel}}$ is evaluated by first-hit lifting and one local bitset collision test at the fixed height, and $\operatorname{LiftToReleasePose}$ maps the image-space optimum to the corresponding 3D release pose. The second stage applies a physics projection operator:
 
-```
-p* = Phi_phys(p_0^release, S)
-```
+$$
+p^*=\Phi_{\mathrm{phys}}(p_0^{\mathrm{release}},\mathcal{S}).
+$$
 
 where `Phi_phys` is implemented by Isaac Sim drop-and-settle. Intuitively, the first stage answers where the object should be released according to the learned layout prior, while the second stage lets the object fall into a physically feasible stable pose.
 
@@ -224,63 +238,67 @@ where `Phi_phys` is implemented by Isaac Sim drop-and-settle. Intuitively, the f
 
 For a general calibrated observation, a pixel corresponds to a 3D camera ray rather than a unique 3D point. We therefore lift image responses only to the first visible surface intersection:
 
-```
-r(t; u) = o_cam + t d(u)
-p_s = FirstHit(r(t; u), S)
-```
+$$
+r(t;u)=o_{\mathrm{cam}}+t\,d(u),
+\qquad
+p_s=\operatorname{FirstHit}(r(t;u),\mathcal{S}).
+$$
 
 where `o_cam` is the camera center, `d(u)` is obtained from the camera intrinsics and extrinsics, and `FirstHit` is implemented by ray casting against scene geometry or by unprojecting a depth map. We do not assign the heatmap response to all voxels along the ray. Voxels behind the first hit are treated as unknown because they are occluded in the current observation. If no valid visible release anchor is found, the system may request active exploration from another viewpoint rather than hallucinating through occlusion.
 
 The first hit `p_s` is a visible surface anchor, not the target object center. It is converted to a voxel index:
 
-```
-v_s = WorldToVoxel(p_s)
-```
+$$
+v_s=\operatorname{WorldToVoxel}(p_s).
+$$
 
-The target object's rotation and scale are taken from the SceneReVis tool-call output. For the fixed rotation `R_sr` and scale `s_sr`, `LiftToReleasePose` searches upward from the surface anchor to find the lowest collision-free release pose.
+The target object's rotation and scale are taken from the SceneReVis tool-call output. For fixed rotation $R_{\mathrm{sr}}$, scale $s_{\mathrm{sr}}$, and minimum release height $h_{\mathrm{rel}}$, $\operatorname{LiftToReleasePose}$ tests the first-hit surface anchor once. A collision rejects that image candidate and advances to the next-highest heatmap response.
 
 ### 4.7 Bitset-Based First-Hit Release Test
 
 A direct SDF representation is expressive but memory-intensive. HAP-Place instead uses compact 3D occupancy bitsets for local release testing.
 
-For each object mesh, we voxelize its occupied volume using parity ray crossing. For a fixed scan axis, each voxel ray collects intersections with mesh triangles. After sorting intersection depths, the inside/outside state is determined by parity:
+For each object mesh, we conservatively voxelize every triangle. A triangle AABB first identifies candidate cells, after which a 13-axis triangle-box separating-axis test marks every voxel whose closed box intersects or touches the triangle. For watertight meshes, enclosed cells are filled after surface rasterization. Thus any voxel containing part of the mesh, including boundary contact, is occupied. The per-object bitset is
 
-```
-inside(x) = crossing_count(x) mod 2
-```
+$$
+B_i\in\{0,1\}^{N_x\times N_y\times N_z}.
+$$
 
-Voxels inside the object are set to 1 in a per-object occupancy bitset:
+The finite cubic grid is derived only from the room envelope; target dimensions do not expand its vertical range. We define an exterior bitset over the room's XZ polygon extruded between its floor and ceiling:
 
-```
-B_i in {0, 1}^{N_x N_y N_z}
-```
+$$
+B_{\mathrm{ext}}(v)=
+\mathbb{1}\!\left[v\notin
+\mathcal{P}_{\mathrm{room}}\times[y_{\mathrm{floor}},y_{\mathrm{ceiling}}]
+\right].
+$$
 
-The full scene occupancy is obtained by bitwise OR:
+All in-grid exterior voxels are explicitly occupied, while a shifted target kernel that extends beyond the finite grid is immediately classified as colliding. The full scene occupancy is obtained by bitwise OR:
 
-```
-B_scene = OR_i B_i
-```
+$$
+B_{\mathrm{scene}}=B_{\mathrm{ext}}\vee\bigvee_i B_i.
+$$
 
-This is important: parity is only used for inside/outside determination of a single mesh. Multiple objects are merged with OR, not XOR.
+This conservative policy avoids false-negative collision checks at voxel boundaries. Multiple objects are merged with OR, so overlap between existing objects cannot cancel occupancy.
 
-The target object is also voxelized after applying the fixed SceneReVis rotation and scale. Let `B_target^{R_sr,s_sr}` be the target occupancy bitset represented in an anchor-centered coordinate frame, where the anchor corresponds to the bottom/contact reference of the object. Collision for a release pose can then be checked efficiently:
+The target object is also voxelized after applying the fixed SceneReVis rotation and scale. Let $B_{\mathrm{target}}^{R_{\mathrm{sr}},s_{\mathrm{sr}},h_{\mathrm{rel}}}$ be the target occupancy bitset represented in an anchor-centered coordinate frame. Its occupied cells are shifted upward by a fixed minimum release height $h_{\mathrm{rel}}$ before packing, leaving $h_{\mathrm{rel}}$ empty voxel layers below the object. Collision for a release pose can then be checked efficiently:
 
-```
-collision(a, R_sr, s_sr) = popcount(B_scene AND Shift(B_target^{R_sr,s_sr}, a))
-```
+$$
+\operatorname{collision}(a,R_{\mathrm{sr}},s_{\mathrm{sr}},h_{\mathrm{rel}})
+=\operatorname{popcount}\!\left(
+B_{\mathrm{scene}}\land
+\operatorname{Shift}(B_{\mathrm{target}}^{R_{\mathrm{sr}},s_{\mathrm{sr}},h_{\mathrm{rel}}},a)
+\right).
+$$
 
-where `a` is the voxel anchor of the release pose. Equivalently, this is binary correlation between the scene occupancy bitset and the target-object bitset kernel. For each visible surface voxel `v_s`, HAP-Place searches along the upward direction for the smallest offset that yields zero collision:
+Here $a$ is the first-hit surface voxel used as the kernel anchor. Equivalently, this is binary correlation between the scene occupancy bitset and the target-object bitset kernel. Each visible surface voxel is evaluated exactly once at the shared fixed release height. The image-domain release predicate is
 
-```
-h_min(v_s, R_sr, s_sr) = min h >= 1
-                         s.t. collision(v_s + h e_up, R_sr, s_sr) = 0
-```
-
-The image-domain release predicate is therefore:
-
-```
-M_rel(u, R_sr, s_sr) = 1[h_min(FirstHitVoxel(u), R_sr, s_sr) exists]
-```
+$$
+M_{\mathrm{rel}}(u,R_{\mathrm{sr}},s_{\mathrm{sr}})
+=\mathbb{1}\!\left[
+\operatorname{collision}(\operatorname{FirstHitVoxel}(u),R_{\mathrm{sr}},s_{\mathrm{sr}},h_{\mathrm{rel}})=0
+\right].
+$$
 
 This predicate is intentionally a release test, not a static support test. We do not require the object footprint to already be supported at the lifted pose. The object may initially be slightly above the surface; gravity and contact dynamics in Isaac Sim determine the final support and stability.
 
@@ -291,64 +309,54 @@ for u in argsort(H_theta, descending=True):
     v_s = FirstHitVoxel(u)
     if v_s is invalid or v_s was already tested:
         continue
-    h = first h >= 1 with collision(v_s + h e_up, R_sr, s_sr) = 0
-    if h exists:
-        return u, v_s + h e_up
+    if collision(v_s, R_sr, s_sr, h_rel) = 0:
+        return u, v_s
 ```
 
-Thus the cost is proportional to the number of high-response visible anchors inspected before success, not to the full voxel volume. For repeated multi-view queries, the same release predicate can be cached as a 3D bitset lookup, but each observation still accesses it through first-hit lifting rather than by projecting a 3D feasibility volume into the image.
+If a candidate collides at $h_{\mathrm{rel}}$, HAP-Place rejects it immediately and evaluates the next-highest heatmap response; it never traverses release height. Thus the cost is proportional to the number of high-response visible anchors inspected before success, not to the full voxel volume. For repeated multi-view queries, the same release predicate can be cached as a 3D bitset lookup, but each observation still accesses it through first-hit lifting rather than by projecting a 3D feasibility volume into the image.
 
 This representation is memory-efficient. For example, a `256^3` grid uses about 2 MB as a bitset, a `512^3` grid uses about 16 MB, and a `1024^3` grid uses about 128 MB, compared with 64 MB, 512 MB, and 4 GB respectively for float32 grids.
 
 More importantly, HAP-Place does not perform dense 3D convolution over all anchors. Once `R_sr` and `s_sr` are fixed by SceneReVis, the target kernel is fixed, but the release test is invoked only for score-ordered visible anchors:
 
-```
-T_release = O(K_success * H_up * C_overlap)
-```
+$$
+T_{\mathrm{release}}=\mathcal{O}(K_{\mathrm{success}}C_{\mathrm{overlap}}).
+$$
 
-where `K_success` is the number of unique first-hit voxels tested before the first feasible anchor is found, `H_up` is the number of upward offsets considered, and `C_overlap` is the bitset overlap cost within the target object's local bounding volume. This avoids the prohibitive `O(N_x N_y N_z * |B_target|)` cost of scanning the entire voxel grid, which is especially important at `1024^3` resolution.
+Here $K_{\mathrm{success}}$ is the number of unique first-hit voxels tested before the first feasible anchor is found, and $C_{\mathrm{overlap}}$ is the bitset overlap cost within the target object's local bounding volume. There is no height-search factor. This avoids the prohibitive $\mathcal{O}(N_xN_yN_z\lvert B_{\mathrm{target}}\rvert)$ cost of scanning the entire voxel grid, which is especially important at $1024^3$ resolution.
 
-### 4.8 Lowest Collision-Free Physics Projection
+### 4.8 Fixed-Height Physics Projection
 
-The release test removes anchors that would initialize the target in collision, but final physical validity is evaluated by simulation. After the constrained heatmap maximum is lifted to a visible surface anchor, HAP-Place computes the lowest collision-free release pose, instantiates the target object in Isaac Sim, and performs a drop-and-settle protocol.
+The release test removes anchors that would initialize the target in collision, but final physical validity is evaluated by simulation. After selecting the highest-scoring feasible visible surface anchor, HAP-Place instantiates the target object at the fixed minimum release height in Isaac Sim and performs a drop-and-settle protocol.
 
-Let `M_o` be the target object mesh in its local coordinates and let `R_0` be the selected orientation. Let `p_s` be the first-hit surface point selected by the constrained heatmap search, and let `n_up` be the world up direction. We place the object center along this direction:
+Let $p_s$ be the first-hit surface point selected by the constrained heatmap search, let $n_{\mathrm{up}}$ be the world up direction, and let $\Delta$ be the voxel pitch. The target bottom release point is
 
-```
-c_0(alpha) = p_s + alpha n_up
-```
+$$
+p_0^{\mathrm{release}}=p_s+h_{\mathrm{rel}}\Delta n_{\mathrm{up}}.
+$$
 
-The release height is the smallest offset `alpha` that keeps the oriented target mesh collision-free with the current scene:
-
-```
-alpha_0 = min alpha
-          s.t. B_scene AND B_target(c_0(alpha), R_0) = empty
-```
-
-In the voxel implementation, `alpha_0` corresponds to the first collision-free voxel layer above the selected surface anchor. This gives a lowest collision-free release pose:
-
-```
-p_0^release = (c_0(alpha_0), R_0)
-```
-
-This design is important: the object is not dropped from an arbitrary high altitude. It is released from the shortest distance above the visible surface that avoids initial penetration. The lifted pose may be temporarily unsupported or slightly suspended; this is intentional. Isaac Sim, not the bitset release test, decides the final contact, support, and stability through gravity and contact dynamics.
+The same $h_{\mathrm{rel}}$ is used for every candidate. A candidate that collides at this height is discarded rather than lifted further. The accepted pose may be temporarily unsupported or slightly suspended; this is intentional. Isaac Sim, not the bitset release test, decides the final contact, support, and stability through gravity and contact dynamics.
 
 The drop-and-settle protocol is:
 
-1. Initialize the object at the lowest collision-free release pose.
+1. Initialize the object at the fixed-height collision-free release pose.
 2. Enable gravity with zero initial velocity.
-3. Simulate until velocities fall below a stability threshold or a timeout is reached.
+3. Simulate until low velocity and valid bottom support persist for consecutive-frame windows or a timeout is reached.
 4. Measure final pose, maximum penetration, tilt angle, displacement from the release anchor, and contact/support state.
 
-In our simulation protocol, existing scene objects are treated as static triangle-mesh colliders, while the target object is instantiated as a dynamic rigid body using convex-decomposition colliders. Linear and angular velocities are initialized to zero. We simulate until both remain below fixed thresholds for `K` consecutive frames or until a timeout is reached. A placement is physically accepted only if the final pose satisfies support/contact validity, maximum penetration below `epsilon_pen`, tilt below `epsilon_tilt`, and stability thresholds. Timeouts and threshold violations are counted as simulator-readiness failures.
+In our simulation protocol, existing scene objects are treated as static triangle-mesh colliders, while the target object is instantiated as a dynamic rigid body using convex-decomposition colliders. SceneReVis uses a right-handed Y-up frame, whereas Isaac Sim uses Z-up; at the simulator boundary we apply the proper rotation $(x,y,z)\mapsto(x,-z,y)$ to all scene geometry, target geometry, and release poses, and map the settled transform back to the SceneReVis frame before evaluation. Linear and angular velocities are initialized to zero. At 120 Hz, stability requires linear speed below $0.01\,\mathrm{m/s}$ and angular speed below $0.05\,\mathrm{rad/s}$ for 60 consecutive frames. Valid support must first be established by a contact point near the target bottom with contact-normal alignment $|n\cdot n_{\mathrm{up}}|\ge 0.7$; side-wall contact alone is rejected. Because PhysX may stop emitting per-frame contact reports after a rigid body enters sleep, this observed support state is retained only while the body remains below the motion thresholds and its bottom height stays within the contact-height tolerance. PhysX contact-report separation provides the settled penetration measurement. We accept only poses with penetration at most $0.005\,\mathrm{m}$, tilt from the prepared SceneReVis orientation at most $15^\circ$, and horizontal displacement from the semantic release anchor at most $0.1\,\mathrm{m}$. Timeouts and threshold violations are counted as simulator-readiness failures.
 
 The physics projection returns the final stable pose:
 
-```
-p* = Phi_phys(p_0^release, S)
-```
+$$
+p^*=\Phi_{\mathrm{phys}}(p_0^{\mathrm{release}},\mathcal{S}).
+$$
 
 The final pose is accepted if it satisfies stability, penetration, tilt, and support thresholds. If the projection fails, the system reports the placement as physically infeasible.
+
+### 4.9 Asynchronous Simulator Execution
+
+For dataset-scale generation, neural release-pose production and physics projection run as asynchronous producer and consumer stages. WSL producers write geometry and manifest artifacts to a shared-volume queue using relative paths and atomically publish completed jobs. Persistent Windows Isaac Sim consumers atomically claim jobs, reuse one `SimulationApp` across samples, and write heartbeat leases and terminal result records. Stale leases are returned to the pending queue under a bounded retry budget. This execution design separates the throughput of learned placement inference from the heavier simulator stage, avoids per-sample simulator startup, and allows one consumer to be assigned to each available GPU. It changes neither the HAP-Place objective nor its physical acceptance criteria.
 
 ## 5. Experiments
 
@@ -382,7 +390,7 @@ We compare HAP-Place against:
 3. **PhyScene3D-style physics baseline**: searches or optimizes object anchors using geometric feasibility and physics constraints without the amortized dense placement prior.
 4. **Heatmap only**: uses the global heatmap peak without release testing.
 5. **Heatmap + release test**: uses score-ordered first-hit bitset release testing without Isaac Sim physics projection.
-6. **HAP-Place full**: release-constrained heatmap maximization, bitset release testing, and lowest collision-free Isaac Sim physics projection.
+6. **HAP-Place full**: release-constrained heatmap maximization, fixed-height bitset release testing, and Isaac Sim physics projection.
 
 The PhyScene3D-style baseline is given the same scene geometry, object mesh, SceneReVis rotation/scale output, and simulation protocol as HAP-Place. It searches over 2D/3D anchors under a fixed test-time optimization budget, using collision, penetration, support, and stability objectives. A trial is marked as failed if it times out, fails to converge, remains in collision, violates physical thresholds, or drifts semantically away from the requested placement region. We report both accuracy and runtime statistics, including long-tail behavior under the fixed budget.
 
@@ -405,7 +413,7 @@ We report:
 
 - **Peak distance**: Euclidean distance between predicted and ground-truth projected centers.
 - **Peak accuracy**: percentage of samples below a pixel tolerance threshold.
-- **SimReady**: percentage of samples that produce a valid output, initialize collision-free, settle stably, satisfy support/contact validity, and remain below the penetration threshold.
+- **SimReady**: percentage of samples that produce a valid output, initialize collision-free, settle stably, satisfy bottom-support validity, and remain below penetration, tilt, and horizontal-displacement thresholds.
 - **Invalid output**: percentage of missing, unparsable, or invalid tool-call/coordinate outputs.
 - **TTO failure**: percentage of physics-first trials that time out, fail to converge, or violate physical thresholds under the fixed test-time optimization budget.
 - **Physical executability**: collision-free rate, support success, maximum penetration, and stability rate after simulation.
@@ -415,15 +423,17 @@ For coordinate- or tool-call-based baselines, physical metrics are computed by a
 
 Formally, a sample is counted as simulator-ready only if:
 
-```
-SimReady = 1[
-    valid_output
-    and initial_collision_free
-    and stable
-    and support_valid
-    and penetration < epsilon_pen
-]
-```
+$$
+\mathrm{SimReady}=\mathbb{1}\!\left[
+\mathrm{ValidOutput}
+\land\mathrm{InitialCollisionFree}
+\land\mathrm{Stable}
+\land\mathrm{SupportValid}
+\land d_{\mathrm{penetration}}<\varepsilon_{\mathrm{pen}}
+\land \theta_{\mathrm{tilt}}<\varepsilon_{\mathrm{tilt}}
+\land d_{\mathrm{horizontal}}<\varepsilon_{\mathrm{disp}}
+\right].
+$$
 
 ### 5.4 Main Results
 
@@ -517,7 +527,7 @@ We categorize failures to make the system boundary conditions explicit:
 
 | Failure type | Typical cause | Detection signal |
 |---|---|---|
-| Thin or open mesh | parity voxelization becomes unreliable | inconsistent occupancy or penetration after simulation |
+| Thin or open mesh | conservative surface occupancy may be over-conservative or leave an unfilled interior | release-test/simulation disagreement |
 | Severe occlusion | first-hit observation misses the intended support region | no valid visible release anchor |
 | Wrong rotation/scale | SceneReVis emits an incorrect orientation or scale | collision-free release exists but final pose is semantically wrong |
 | Support ambiguity | multiple nearby supports or stacked objects | large displacement after drop-and-settle |
@@ -548,18 +558,18 @@ The bitset release test is a practical bridge between visual prediction and phys
 
 ## 7. Limitations
 
-The current framework depends on reliable mesh geometry and camera calibration. Parity voxelization assumes reasonably watertight meshes; open or self-intersecting meshes may require repair or robust voxelization. The heatmap model is trained from existing scene layouts, so it may inherit dataset biases. Finally, Isaac Sim physics projection adds engineering complexity and requires consistent asset physics properties.
+The current framework depends on reliable mesh geometry and camera calibration. Conservative surface voxelization can over-occupy thin or touching structures, while open meshes do not define an unambiguous solid interior and may require repair. The heatmap model is trained from existing scene layouts, so it may inherit dataset biases. Finally, Isaac Sim physics projection adds engineering complexity and requires consistent asset physics properties.
 
 ## 8. Conclusion
 
-We presented HAP-Place, a fast physics-grounded framework for simulator-ready object re-placement in 3D indoor scenes. By formulating placement as a two-stage process that first maximizes a feed-forward demonstration-aligned placement prior under a first-hit release constraint and then applies lowest collision-free Isaac Sim physics projection, HAP-Place aims to generate placements that are precise, layout-consistent, physically executable, and efficient. This approach bridges the gap between VLM/LLM semantic layout reasoning and physics-first scene construction, providing a practical path toward scalable simulator-ready data generation for embodied agents.
+We presented HAP-Place, a fast physics-grounded framework for simulator-ready object re-placement in 3D indoor scenes. By formulating placement as a two-stage process that first maximizes a feed-forward demonstration-aligned placement prior under a fixed-minimum-height first-hit release constraint and then applies Isaac Sim physics projection, HAP-Place aims to generate placements that are precise, layout-consistent, physically executable, and efficient. This approach bridges the gap between VLM/LLM semantic layout reasoning and physics-first scene construction, providing a practical path toward scalable simulator-ready data generation for embodied agents.
 
 ## Notes for the Next Revision
 
 - Fill in final dataset statistics.
 - Add exact training configuration and model size.
-- Add bitset voxelization implementation details once finalized.
-- Fill in Isaac Sim thresholds (`K`, `epsilon_pen`, `epsilon_tilt`, velocity limits, timeout).
+- Add conservative AABB + 13-axis SAT voxelization runtime and memory measurements.
+- Validate the fixed Isaac Sim thresholds across object categories and report sensitivity.
 - Replace placeholder experiment/runtime/ablation tables with real numbers.
 - Add PhyScene3D-style fixed-budget implementation details and TTO failure analysis.
 - Fill in SceneReVis rotation/scale oracle and perturbation ablation results.
